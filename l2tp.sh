@@ -42,7 +42,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # ----------------------------------------------------------------------------
 # 常量
 # ----------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.1"
 readonly DEFAULT_NET="192.168.42"
 readonly DEFAULT_DNS="8.8.8.8,1.1.1.1"
 readonly DEFAULT_MTU=1280
@@ -2181,6 +2181,8 @@ cmd_uninstall() {
 
 main() {
     parse_args "$@"
+    # 首行输出版本号，便于确认下载到的不是 CDN 缓存的旧脚本
+    printf '%sL2TP/IPsec VPN 一键部署脚本 v%s%s\n' "$C_BOLD" "$SCRIPT_VERSION" "$C_RESET"
     require_root "$@"
     acquire_lock
     case $CMD in

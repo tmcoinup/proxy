@@ -1861,28 +1861,77 @@ tune_kernel() {
 # ----------------------------------------------------------------------------
 # 自检与公网信息
 # ----------------------------------------------------------------------------
-# SOCKS5 握手 + RFC1929 认证探测；凭据经环境变量传递，不出现在进程参数中
-# 返回: 0 认证成功；1 认证被拒；2 连接或协议错误
+# SOCKS5 握手 + RFC1929 认证探测
+# 不使用 bash 的 /dev/tcp：部分云厂商镜像 (如腾讯云) 内置了安全审计版 bash，
+# 会向 /dev/tcp 连接注入审计数据，污染握手报文，Dante 判定协议错误后直接断开
+# 凭据经 curl 配置 (stdin) 或环境变量传递，不出现在进程参数中
+# 返回: 0 认证成功；1 认证被拒；2 连接或协议错误；3 缺少探测工具 (curl / python3)
 socks5_auth_probe() {
-    local rc=0
-    # shellcheck disable=SC2016  # 单引号内脚本由子 bash 展开
-    PROBE_USER=$1 PROBE_PASS=$2 PROBE_PORT=$3 timeout 10 bash -c '
-        exec 3<>"/dev/tcp/127.0.0.1/${PROBE_PORT}" || exit 2
-        printf "\x05\x01\x02" >&3
-        resp=$(dd bs=1 count=2 <&3 2>/dev/null | od -An -tx1 | tr -d " \n")
-        [[ $resp == "0502" ]] || exit 2
-        {
-            printf "\x01"
-            printf "\\$(printf "%03o" "${#PROBE_USER}")"
-            printf "%s" "$PROBE_USER"
-            printf "\\$(printf "%03o" "${#PROBE_PASS}")"
-            printf "%s" "$PROBE_PASS"
-        } >&3
-        resp=$(dd bs=1 count=2 <&3 2>/dev/null | od -An -tx1 | tr -d " \n")
-        [[ $resp == "0100" ]] && exit 0
-        exit 1
-    ' 2>/dev/null || rc=$?
-    return "$rc"
+    if has_cmd curl; then
+        socks5_auth_probe_curl "$@"
+    elif has_cmd python3; then
+        socks5_auth_probe_python "$@"
+    else
+        return 3
+    fi
+}
+
+# 认证通过后 CONNECT 本机回环 discard 端口：配置中已禁止访问回环地址，
+# 代理返回 "规则不允许" 即证明认证阶段已通过，全程不产生出网流量
+# noproxy = "" 覆盖环境变量 NO_PROXY，防止回环目标绕过代理直连
+socks5_auth_probe_curl() {
+    local u p out rc=0
+    u=$(curl_cfg_escape "$1")
+    p=$(curl_cfg_escape "$2")
+    out=$(printf 'proxy = "socks5://127.0.0.1:%s"\nproxy-user = "%s:%s"\nnoproxy = ""\n' "$3" "$u" "$p" \
+        | LC_ALL=C curl -q -K - -sS -o /dev/null --connect-timeout 5 --max-time 10 \
+            "http://127.0.0.1:9/" 2>&1) || rc=$?
+    if (( rc == 0 )); then
+        return 0
+    fi
+    # curl 7.73+ 的 SOCKS 错误统一为退出码 97，更早版本为 7，故按错误信息区分阶段
+    case ${out,,} in
+        *"user was rejected"*)          return 1 ;;
+        *"complete socks5 connection"*) return 0 ;;
+        *)                              return 2 ;;
+    esac
+}
+
+# 无 curl 时的兜底：python3 原生 socket 完成 方法协商 + RFC1929 子协商
+socks5_auth_probe_python() {
+    PROBE_USER=$1 PROBE_PASS=$2 PROBE_PORT=$3 python3 -I - 2>/dev/null <<'PY'
+import os
+import socket
+import sys
+
+
+def recv_exact(sock, size):
+    buf = b""
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            raise ConnectionError("connection closed by proxy")
+        buf += chunk
+    return buf
+
+
+def main():
+    user = os.environ["PROBE_USER"].encode()
+    pwd = os.environ["PROBE_PASS"].encode()
+    port = int(os.environ["PROBE_PORT"])
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            sock.sendall(b"\x05\x01\x02")
+            if recv_exact(sock, 2) != b"\x05\x02":
+                return 2
+            sock.sendall(bytes([1, len(user)]) + user + bytes([len(pwd)]) + pwd)
+            return 0 if recv_exact(sock, 2) == b"\x01\x00" else 1
+    except (OSError, ValueError):
+        return 2
+
+
+sys.exit(main())
+PY
 }
 
 # 经本机代理访问 URL；凭据经 curl 配置 (stdin) 传入，不出现在进程参数中
@@ -1966,15 +2015,19 @@ verify_deployment() {
     case $rc in
         0) log_info "认证自检通过：正确的用户名密码可以登录" ;;
         1) die "认证自检失败：正确的用户名密码被拒绝，请检查 ${CONF_FILE}" ;;
+        3) log_warn "缺少 curl / python3，跳过认证与安全自检" ;;
         *) die "认证自检失败：无法完成 SOCKS5 握手 (端口 ${SOCKS_PORT})" ;;
     esac
 
-    rc=0
-    socks5_auth_probe "$SOCKS_USER" "wrong-$(rand_str 12 'a-z0-9')" "$SOCKS_PORT" || rc=$?
-    if (( rc == 0 )); then
-        die "安全自检失败：错误密码竟然可以登录，已中止"
+    if (( rc != 3 )); then
+        rc=0
+        socks5_auth_probe "$SOCKS_USER" "wrong-$(rand_str 12 'a-z0-9')" "$SOCKS_PORT" || rc=$?
+        case $rc in
+            0) die "安全自检失败：错误密码竟然可以登录，已中止" ;;
+            1) log_info "安全自检通过：错误的密码会被拒绝" ;;
+            *) die "安全自检失败：错误密码探测未能完成 SOCKS5 握手 (端口 ${SOCKS_PORT})" ;;
+        esac
     fi
-    log_info "安全自检通过：错误的密码会被拒绝"
 
     detect_public_ip
 
@@ -2189,6 +2242,7 @@ cmd_status() {
     case $rc in
         0) log_info "认证自检: 通过" ;;
         1) log_error "认证自检: 用户名密码被拒绝" ;;
+        3) log_warn "认证自检: 缺少 curl / python3，已跳过" ;;
         *) log_error "认证自检: SOCKS5 握手失败" ;;
     esac
     log_info "开机自启: $(service_enabled_text)"

@@ -42,7 +42,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # ----------------------------------------------------------------------------
 # 常量
 # ----------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly DEFAULT_PORT=6666
 readonly DEFAULT_UDP_RANGE="50000-59999"
 
@@ -50,7 +50,31 @@ readonly DANTE_MIN_MAJOR=1
 readonly DANTE_MIN_MINOR=4
 readonly DANTE_SRC_VERSION="1.4.4"
 readonly DANTE_SRC_SHA256="1973c7732f1f9f0a4c0ccf2c1ce462c7c25060b25643ea90f9b98f53a813faec"
-readonly DANTE_SRC_URL_DEFAULT="https://www.inet.no/dante/files/dante-${DANTE_SRC_VERSION}.tar.gz"
+readonly DANTE_SRC_TARBALL="dante-${DANTE_SRC_VERSION}.tar.gz"
+# Gentoo distfiles 按 BLAKE2B(文件名) 的前 2 位十六进制分目录，升级 DANTE_SRC_VERSION 时同步更新:
+#   printf 'dante-x.y.z.tar.gz' | b2sum | cut -c1-2
+readonly DANTE_SRC_GENTOO_DIR="0b"
+# 源码包候选地址：上游 + 原样收录上游源码包的发行版 distfiles 镜像 (国内 / 海外)。
+# 下载前并发测速排序，逐个尝试直到 SHA256 校验通过；HTTP 地址同样强制校验，内容无法被篡改
+readonly DANTE_SRC_MIRRORS=(
+    "https://www.inet.no/dante/files/${DANTE_SRC_TARBALL}"
+    "https://mirrors.ustc.edu.cn/gentoo/distfiles/${DANTE_SRC_GENTOO_DIR}/${DANTE_SRC_TARBALL}"
+    "https://mirrors.tuna.tsinghua.edu.cn/gentoo/distfiles/${DANTE_SRC_GENTOO_DIR}/${DANTE_SRC_TARBALL}"
+    "https://mirrors.aliyun.com/gentoo/distfiles/${DANTE_SRC_GENTOO_DIR}/${DANTE_SRC_TARBALL}"
+    "https://mirrors.cloud.tencent.com/gentoo/distfiles/${DANTE_SRC_GENTOO_DIR}/${DANTE_SRC_TARBALL}"
+    "https://mirrors.huaweicloud.com/gentoo/distfiles/${DANTE_SRC_GENTOO_DIR}/${DANTE_SRC_TARBALL}"
+    "https://mirrors.nju.edu.cn/gentoo/distfiles/${DANTE_SRC_GENTOO_DIR}/${DANTE_SRC_TARBALL}"
+    "https://mirrors.bfsu.edu.cn/gentoo/distfiles/${DANTE_SRC_GENTOO_DIR}/${DANTE_SRC_TARBALL}"
+    "https://mirrors.ustc.edu.cn/freebsd-ports/distfiles/${DANTE_SRC_TARBALL}"
+    "https://mirrors.nju.edu.cn/freebsd-ports/distfiles/${DANTE_SRC_TARBALL}"
+    "https://distfiles.gentoo.org/distfiles/${DANTE_SRC_GENTOO_DIR}/${DANTE_SRC_TARBALL}"
+    "https://cdn.netbsd.org/pub/pkgsrc/distfiles/${DANTE_SRC_TARBALL}"
+    "https://sources.buildroot.net/dante/${DANTE_SRC_TARBALL}"
+    "https://sources.openwrt.org/${DANTE_SRC_TARBALL}"
+    "https://tarballs.nixos.org/sha256/${DANTE_SRC_SHA256}"
+    "http://distcache.freebsd.org/ports-distfiles/${DANTE_SRC_TARBALL}"
+    "http://www.inet.no/dante/files/${DANTE_SRC_TARBALL}"
+)
 readonly DANTE_SRC_BIN="/usr/local/sbin/sockd"
 
 readonly SERVICE_NAME="danted"
@@ -126,6 +150,7 @@ PREV_FW_ZONE=""
 
 TMP_DIR=""
 POLICY_RC_CREATED=0
+CURL_RETRY_ALL=0
 
 # ----------------------------------------------------------------------------
 # 输出
@@ -306,7 +331,9 @@ SOCKS5 代理服务一键部署脚本 v${SCRIPT_VERSION} (基于 Dante)
 
 环境变量 (优先级低于命令行参数):
   SOCKS5_USER  SOCKS5_PASS  SOCKS5_PORT  SOCKS5_UDP_RANGE  SOCKS5_IFACE
-  DANTE_SRC_URL  (源码包下载地址，可指向内网镜像，SHA256 仍强制校验)
+  DANTE_SRC_URL   源码包下载地址，最先尝试，失败后仍回退到内置镜像 (SHA256 强制校验)
+  DANTE_SRC_FILE  本地源码包路径 (离线部署：先上传 ${DANTE_SRC_TARBALL}，SHA256 强制校验)
+  未指定时自动并发测速国内外 ${#DANTE_SRC_MIRRORS[@]} 个镜像，按速度依次尝试
 
 示例:
   sudo bash $0
@@ -619,6 +646,17 @@ dante_pkg_name() {
     esac
 }
 
+# 软件源中是否存在可安装的候选版本；确定不存在时不再重试 (如 Debian 13 未收录 dante-server)
+pkg_has_candidate() {
+    local out re='Candidate: *([^[:space:]]+)'
+    case $PKG_MGR in
+        apt)
+            out=$(apt-cache policy "$1" 2>/dev/null || true)
+            [[ $out =~ $re ]] && [[ ${BASH_REMATCH[1]} != "(none)" ]] ;;
+        *)  return 0 ;;
+    esac
+}
+
 pkg_installed() {
     case $PKG_MGR in
         apt)     [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true)" == *"install ok installed"* ]] ;;
@@ -703,6 +741,10 @@ find_package_dante() {
 install_dante_package() {
     local pkg
     pkg=$(dante_pkg_name)
+    if ! pkg_has_candidate "$pkg"; then
+        log_info "当前系统软件源未收录 ${pkg} (${OS_NAME})"
+        return 1
+    fi
     log_info "尝试通过系统软件源安装 ${pkg}"
     if [[ $PKG_MGR == "apt" ]]; then
         block_service_autostart
@@ -737,15 +779,147 @@ install_build_deps() {
     done
 }
 
+# curl 是否支持某个选项 (先取完整帮助再匹配，避免 grep -q 提前退出触发 SIGPIPE + pipefail)
+curl_supports() {
+    local help
+    help=$(curl --help all 2>/dev/null || true)
+    [[ $help == *"$1"* ]]
+}
+
+# 下载单个地址；$3=1 为快速模式 (用于测速未响应的地址：不重试、缩短连接超时，出网受阻时不长时间空等)。
+# --retry-all-errors (curl 7.71+) 让 TLS 握手 / 传输被中途重置 (curl 35/56，国内访问海外站点常见)
+# 也能重试；20 秒内速度低于 1KB/s 视为卡死，立即放弃以便切换镜像
 download_file() {
-    local url=$1 out=$2
+    local url=$1 out=$2 quick=${3:-0} opts=()
+    rm -f -- "$out"
     if has_cmd curl; then
-        curl -fL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 600 -sS -o "$out" "$url"
+        opts=(-fL -sS --max-time 300 --speed-limit 1024 --speed-time 20)
+        if (( quick )); then
+            opts+=(--connect-timeout 5)
+        else
+            opts+=(--connect-timeout 10 --retry 2 --retry-delay 2)
+            if (( CURL_RETRY_ALL )); then
+                opts+=(--retry-all-errors)
+            fi
+        fi
+        curl "${opts[@]}" -o "$out" "$url"
     elif has_cmd wget; then
-        wget -q --tries=3 --timeout=30 -O "$out" "$url"
+        if (( quick )); then
+            wget -q --tries=1 --timeout=10 -O "$out" "$url"
+        else
+            wget -q --tries=3 --timeout=20 -O "$out" "$url"
+        fi
     else
-        die "缺少 curl / wget，无法下载源码"
+        return 127
     fi
+}
+
+# 并发测速：每个地址一个后台 curl 只取首字节 (Range 0-0)，总耗时取决于最慢的超时 (<= 8 秒)。
+# 每行输出 "<状态> <地址>"：ok 为可达 (按耗时升序)，na 为测速未响应 (保留作兜底)，- 为未测速
+rank_urls() {
+    local dir=$1 i t idx seen=" "
+    shift
+    local urls=("$@") pids=()
+    if ! has_cmd curl; then
+        printf -- '- %s\n' "${urls[@]}"
+        return 0
+    fi
+    mkdir -p -- "$dir"
+    for i in "${!urls[@]}"; do
+        (
+            if t=$(curl -fsS -L -r 0-0 -o /dev/null --connect-timeout 5 --max-time 8 \
+                    -w '%{time_total}' "${urls[i]}" 2>/dev/null); then
+                printf '%s %s\n' "$t" "$i" >"${dir}/${i}"
+            fi
+        ) &
+        pids+=("$!")
+    done
+    for i in "${pids[@]}"; do
+        wait "$i" || true
+    done
+    while read -r t idx; do
+        [[ $idx =~ ^[0-9]+$ && -n ${urls[idx]:-} ]] || continue
+        printf 'ok %s\n' "${urls[idx]}"
+        seen+="${idx} "
+    done < <(cat -- "$dir"/* 2>/dev/null | sort -n -k1,1 -k2,2n || true)
+    for i in "${!urls[@]}"; do
+        if [[ $seen != *" ${i} "* ]]; then
+            printf 'na %s\n' "${urls[i]}"
+        fi
+    done
+}
+
+# 获取 Dante 源码包到 $1：DANTE_SRC_FILE (本地) > DANTE_SRC_URL > 内置镜像 (并发测速排序)。
+# 逐个地址尝试直到 SHA256 校验通过，单个镜像被阻断 / 限速 / 劫持都会自动切换到下一个
+fetch_dante_source() {
+    local out=$1 url state i urls=() quick=() added=0 reachable=0 total
+    if [[ -n ${DANTE_SRC_FILE:-} ]]; then
+        [[ -f $DANTE_SRC_FILE && -r $DANTE_SRC_FILE ]] \
+            || die "DANTE_SRC_FILE 指定的文件不存在或不可读: ${DANTE_SRC_FILE}"
+        verify_sha256 "$DANTE_SRC_FILE" "$DANTE_SRC_SHA256" \
+            || die "DANTE_SRC_FILE SHA256 校验失败 (需要原始的 ${DANTE_SRC_TARBALL}): ${DANTE_SRC_FILE}"
+        cp -f -- "$DANTE_SRC_FILE" "$out"
+        log_info "使用本地源码包: ${DANTE_SRC_FILE} (SHA256 校验通过)"
+        return 0
+    fi
+
+    has_cmd curl || has_cmd wget || die "缺少 curl / wget，无法下载源码 (可通过 DANTE_SRC_FILE 指定本地源码包)"
+    CURL_RETRY_ALL=0
+    if has_cmd curl && curl_supports --retry-all-errors; then
+        CURL_RETRY_ALL=1
+    fi
+
+    if [[ -n ${DANTE_SRC_URL:-} ]]; then
+        urls+=("$DANTE_SRC_URL")
+        quick+=(0)
+    fi
+    log_info "并发测速 ${#DANTE_SRC_MIRRORS[@]} 个源码镜像..."
+    while read -r state url; do
+        [[ -n $url && $url != "${DANTE_SRC_URL:-}" ]] || continue
+        urls+=("$url")
+        added=$((added + 1))
+        if [[ $state == "na" ]]; then
+            quick+=(1)
+        else
+            quick+=(0)
+        fi
+        if [[ $state == "ok" ]]; then
+            reachable=$((reachable + 1))
+        fi
+    done < <(rank_urls "${TMP_DIR}/probe" "${DANTE_SRC_MIRRORS[@]}")
+    if (( added == 0 )); then
+        for url in "${DANTE_SRC_MIRRORS[@]}"; do
+            urls+=("$url")
+            quick+=(0)
+        done
+    fi
+    if (( reachable > 0 )); then
+        log_info "测速完成: ${reachable}/${#DANTE_SRC_MIRRORS[@]} 个镜像可达，按响应速度依次尝试"
+    elif has_cmd curl; then
+        log_warn "测速未发现可达镜像 (出网可能受限)，仍逐个快速尝试"
+    fi
+
+    total=${#urls[@]}
+    for i in "${!urls[@]}"; do
+        url=${urls[i]}
+        log_info "下载源码 ($((i + 1))/${total}): ${url}"
+        if ! download_file "$url" "$out" "${quick[i]}"; then
+            log_warn "下载失败，切换下一个地址"
+            continue
+        fi
+        if verify_sha256 "$out" "$DANTE_SRC_SHA256"; then
+            log_info "SHA256 校验通过"
+            return 0
+        fi
+        log_warn "SHA256 不一致 (文件损坏、被劫持或不是原始源码包)，切换下一个地址"
+    done
+
+    rm -f -- "$out"
+    log_error "全部 ${total} 个源码地址均下载失败，请检查服务器出网 (DNS / 防火墙 / 安全组出站规则)，或:"
+    log_error "  1) 指定可访问的地址: DANTE_SRC_URL=<URL> bash $0"
+    log_error "  2) 离线部署: 上传 ${DANTE_SRC_TARBALL} 后执行 DANTE_SRC_FILE=<文件路径> bash $0"
+    log_error "     (SHA256 ${DANTE_SRC_SHA256})"
+    exit 1
 }
 
 verify_sha256() {
@@ -761,20 +935,17 @@ verify_sha256() {
 }
 
 build_dante_from_source() {
-    local url=${DANTE_SRC_URL:-$DANTE_SRC_URL_DEFAULT} tarball src jobs log
+    local tarball src jobs log
     log_info "源码编译 Dante v${DANTE_SRC_VERSION}"
     install_build_deps
 
     TMP_DIR=$(mktemp -d /tmp/socks5-build.XXXXXX)
-    tarball="${TMP_DIR}/dante-${DANTE_SRC_VERSION}.tar.gz"
+    tarball="${TMP_DIR}/${DANTE_SRC_TARBALL}"
     src="${TMP_DIR}/dante-${DANTE_SRC_VERSION}"
     log="${TMP_DIR}/build.log"
     jobs=$(cpu_count)
 
-    log_info "下载: ${url}"
-    download_file "$url" "$tarball" || die "源码下载失败: ${url} (可通过 DANTE_SRC_URL 指定镜像地址)"
-    verify_sha256 "$tarball" "$DANTE_SRC_SHA256" || die "源码 SHA256 校验失败，文件可能被篡改或损坏"
-    log_info "SHA256 校验通过"
+    fetch_dante_source "$tarball"
 
     tar -xzf "$tarball" -C "$TMP_DIR"
     [[ -d $src ]] || die "源码解压失败"

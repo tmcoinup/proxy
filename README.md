@@ -50,6 +50,15 @@ sudo bash l2tp.sh   -u alice -p 'S3cret_pw' -k 'MyPsk_123'
 curl -fsSL https://raw.githubusercontent.com/tmcoinup/proxy/main/socks5.sh | sudo bash -s -- -u alice -p 'S3cret_pw'
 ```
 
+国内服务器访问 `raw.githubusercontent.com` 不稳定时，改用 jsDelivr CDN 下载脚本：
+
+```bash
+curl -fsSL https://cdn.jsdelivr.net/gh/tmcoinup/proxy@main/socks5.sh -o socks5.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/tmcoinup/proxy@main/l2tp.sh   -o l2tp.sh
+```
+
+> jsDelivr 对分支内容有缓存，刚推送的更新可能延迟生效。
+
 部署完成后终端会打印完整连接信息（服务器 IP、端口、凭据、代理链接等），之后可随时用 `socks5ctl info` / `l2tpctl info` 再次查看。
 
 > 云服务器还需在**安全组**放行端口：SOCKS5 放行 TCP 监听端口与 UDP 中继端口段；L2TP 放行 UDP 500 与 4500（UDP 1701 无需对外放行）。
@@ -114,13 +123,31 @@ flowchart LR
 | `-y, --yes` | 卸载时不再确认 | — |
 | `-h, --help` / `-v, --version` | 帮助 / 版本 | — |
 
-环境变量（优先级低于命令行参数）：`SOCKS5_USER`、`SOCKS5_PASS`、`SOCKS5_PORT`、`SOCKS5_UDP_RANGE`、`SOCKS5_IFACE`；`DANTE_SRC_URL` 可把源码包指向内网镜像，SHA256 仍强制校验。
+环境变量（优先级低于命令行参数）：`SOCKS5_USER`、`SOCKS5_PASS`、`SOCKS5_PORT`、`SOCKS5_UDP_RANGE`、`SOCKS5_IFACE`。
+
+源码包来源（均强制 SHA256 校验）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `DANTE_SRC_FILE` | 本地源码包路径，用于离线部署：先把 `dante-1.4.4.tar.gz` 上传到服务器，再 `DANTE_SRC_FILE=/root/dante-1.4.4.tar.gz bash socks5.sh` |
+| `DANTE_SRC_URL` | 自定义下载地址（如内网镜像），最先尝试，失败后仍回退到内置镜像 |
+| （默认） | 内置 17 个地址：上游 inet.no，中科大 / 清华 / 阿里云 / 腾讯云 / 华为云 / 南大 / 北外的 Gentoo distfiles 镜像，中科大 / 南大的 FreeBSD distfiles 镜像，以及 Gentoo / NetBSD / Buildroot / OpenWrt / NixOS 等海外源 |
+
+### 国内服务器网络适配
+
+源码编译时会自动处理国内访问海外站点的常见问题，无需手动配置（l2tp.sh 下载 xl2tpd 源码时使用同一套机制）：
+
+1. **并发测速**：同时向全部镜像请求首字节（每个地址一个后台 curl，总耗时 ≤ 8 秒），按响应速度排序。国内服务器自然优先使用国内镜像，海外服务器优先使用上游与海外镜像。
+2. **逐个回退**：按排序依次下载，失败、限速（20 秒内低于 1 KB/s）或 SHA256 不一致都会立即切换到下一个地址。
+3. **TLS 中断重试**：curl 7.71+ 启用 `--retry-all-errors`，TLS 握手或传输被中途重置（`curl: (35)` / `curl: (56) unexpected eof`）也会重试。
+4. **出网受阻时快速失败**：测速未响应的地址只快速尝试一次（不重试、连接超时 5 秒），出网被完全封锁时约 1.5 分钟内给出明确提示，而不是长时间卡住。
+5. **软件源未收录时不重试**：先用 `apt-cache policy` 检查是否有候选版本，例如 Debian 13 (trixie) 未收录 `dante-server`，会直接转入源码编译，不再白等 3 次重试。
 
 ### 部署流程
 
 1. **环境识别**：发行版、版本、架构、包管理器、init 系统，计算主进程数。
 2. **确定参数**：命令行 > 环境变量 > 上次部署状态 > 默认值，并做格式校验。
-3. **安装依赖与 Dante**：依次尝试复用上次源码编译的二进制、系统软件包（版本需 ≥ 1.4，过旧则卸载）、源码编译（下载后校验 SHA256）。
+3. **安装依赖与 Dante**：依次尝试复用上次源码编译的二进制、系统软件包（版本需 ≥ 1.4，过旧则卸载；软件源未收录则跳过）、源码编译（多镜像并发测速后依次下载，校验 SHA256）。
 4. **识别出口网卡**：按 `ip route get` 对 1.1.1.1 / 223.5.5.5 / 8.8.8.8 的实际路由决策识别，兼容策略路由与多网卡；同时实测 IPv6 能否出网。
 5. **端口检查**：先停止旧实例并停用发行版自带的 `sockd` / `dante-server` 服务，再检查端口占用。
 6. **配置账号**：创建或更新代理账号，密码统一用 SHA-512 crypt 写入；单账号模式，会清理旧的托管账号。
@@ -245,13 +272,23 @@ flowchart LR
 
 随机凭据排除了易混淆字符 `0 O 1 I l`，方便在手机上输入。端口固定为 UDP 500 / 4500 / 1701，不可更改。
 
-环境变量（优先级低于命令行参数）：`VPN_USER`、`VPN_PASSWORD`、`VPN_IPSEC_PSK`、`VPN_NET`、`VPN_DNS`、`VPN_MTU`、`VPN_IFACE`；`XL2TPD_SRC_URL` 可把源码包指向内网镜像，SHA256 仍强制校验。
+环境变量（优先级低于命令行参数）：`VPN_USER`、`VPN_PASSWORD`、`VPN_IPSEC_PSK`、`VPN_NET`、`VPN_DNS`、`VPN_MTU`、`VPN_IFACE`。
+
+xl2tpd 源码包来源（均强制 SHA256 校验，国内网络适配机制与 socks5.sh 相同，见[国内服务器网络适配](#国内服务器网络适配)）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `XL2TPD_SRC_FILE` | 本地源码包路径，用于离线部署：先把 `xl2tpd-1.3.20.tar.gz` 上传到服务器，再 `XL2TPD_SRC_FILE=/root/xl2tpd-1.3.20.tar.gz bash l2tp.sh` |
+| `XL2TPD_SRC_URL` | 自定义下载地址（如内网镜像），最先尝试，失败后仍回退到内置镜像 |
+| （默认） | 内置 20 个地址：GitHub / codeload，阿里云 / 清华 / 中科大 / 腾讯云 / 华为云的 Debian 与 Ubuntu 软件池（`xl2tpd_1.3.20.orig.tar.gz` 与 GitHub 归档逐字节一致），中科大 / 清华 / 阿里云 / 南大的 Gentoo distfiles，以及 Debian / Ubuntu / Gentoo / Alpine 官方源 |
+
+> EPEL（RHEL 系安装 xl2tpd 用）仍从 `dl.fedoraproject.org` 获取：`epel-release-latest` 会随版本更新，无法固定 SHA256，从第三方镜像下载就失去了完整性保障；而且该地址在国内可以直接访问。
 
 ### 部署流程
 
 1. **环境识别**：发行版、架构、包管理器；检查容器环境与 `/dev/ppp`。
 2. **确定参数**并记录部署前是否已装有 libreswan / xl2tpd（卸载时保留这些软件）。
-3. **安装软件**：先拦截已安装的 strongSwan（与 libreswan 互斥，apt 会静默卸载对方）；安装 libreswan、ppp、iptables；xl2tpd 依次尝试系统源、EPEL、源码编译。
+3. **安装软件**：先拦截已安装的 strongSwan（与 libreswan 互斥，apt 会静默卸载对方）；安装 libreswan、ppp、iptables（apt 软件源未收录 libreswan 时立即报错，不再重试）；xl2tpd 依次尝试系统源、EPEL、源码编译（多镜像并发测速后依次下载，校验 SHA256）。
 4. **版本检测**：确认 `ipsec` 实现是 libreswan 且版本 ≥ 3.19。
 5. **识别出口网卡与公网 IP**，检查客户端网段是否与本机网卡冲突；公网 IP 与网卡地址不同时判定为 NAT 后部署。
 6. **冲突检查**：strongSwan 是否在运行，UDP 500 / 4500 / 1701 是否被占用。
@@ -389,7 +426,7 @@ REG ADD HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent /v AssumeUDPEncapsula
 - **源码完整性**：源码包强制 SHA256 校验，镜像地址同样校验。
 - **凭据不进进程参数**：自检时凭据通过环境变量或 stdin 传给子进程。
 - **不破坏现有环境**：备份非本脚本生成的配置；拒绝修改已存在的非托管系统用户；检测到 strongSwan 即中止；Debian 系安装软件包时用 `policy-rc.d` 阻止服务以默认配置自动启动。
-- **网络操作重试**：软件包安装与源码下载失败时自动重试。
+- **网络操作重试**：软件包安装失败时自动重试（软件源确定未收录时不重试）；Dante / xl2tpd 源码多镜像并发测速、逐个回退，TLS 中途被重置也会重试。
 - **无日志**：Dante 不配置日志输出；libreswan、xl2tpd、pppd 的日志指向 `/dev/null`；systemd 服务丢弃标准输出与错误输出。
 
 ---
@@ -407,7 +444,8 @@ REG ADD HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent /v AssumeUDPEncapsula
 | IPsec 配置校验报 IKEv1 相关错误 | 当前发行版的 libreswan 编译时禁用了 IKEv1（L2TP/IPsec 必需），需更换发行版或使用官方源码构建的 libreswan |
 | Windows 连接 L2TP 报错 809 | 服务器在 NAT 后，按[客户端配置](#客户端配置)添加注册表项并重启 |
 | 未检测到 `/dev/ppp` | 在 VPS 控制面板开启 PPP / TUN |
-| 系统软件源中没有 Dante / xl2tpd | 脚本会自动源码编译；内网环境可通过 `DANTE_SRC_URL` / `XL2TPD_SRC_URL` 指定镜像 |
+| 系统软件源中没有 Dante / xl2tpd | 脚本会自动源码编译（如 Debian 13 未收录 `dante-server`）；内网环境可通过 `DANTE_SRC_URL` / `XL2TPD_SRC_URL` 指定镜像 |
+| 国内服务器下载 Dante / xl2tpd 源码报 `curl: (35)` / `curl: (56) ... unexpected eof` | 上游 inet.no / GitHub 在国内连接不稳定。脚本会自动测速并切换到国内镜像；若服务器完全无法出网，上传源码包后用 `DANTE_SRC_FILE=<路径>` / `XL2TPD_SRC_FILE=<路径>` 离线部署 |
 | 忘记连接信息 | 执行 `socks5ctl info` 或 `l2tpctl info` |
 
 卸载：

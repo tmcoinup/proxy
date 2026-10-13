@@ -42,7 +42,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # ----------------------------------------------------------------------------
 # 常量
 # ----------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly DEFAULT_NET="192.168.42"
 readonly DEFAULT_DNS="8.8.8.8,1.1.1.1"
 readonly DEFAULT_MTU=1280
@@ -52,7 +52,36 @@ readonly L2TP_PORT=1701
 
 readonly XL2TPD_SRC_VERSION="1.3.20"
 readonly XL2TPD_SRC_SHA256="3db95450c5e1efaeea7547af344b5621f4453af3c227f26ec43bcbc79087b045"
-readonly XL2TPD_SRC_URL_DEFAULT="https://github.com/xelerance/xl2tpd/archive/refs/tags/v${XL2TPD_SRC_VERSION}.tar.gz"
+readonly XL2TPD_SRC_TARBALL="xl2tpd-${XL2TPD_SRC_VERSION}.tar.gz"
+# Debian / Ubuntu 软件池的 orig 包与 GitHub tag 归档逐字节一致 (国内各镜像站均同步软件池)
+readonly XL2TPD_SRC_ORIG="xl2tpd_${XL2TPD_SRC_VERSION}.orig.tar.gz"
+# Gentoo distfiles 按 BLAKE2B(文件名) 的前 2 位十六进制分目录，升级 XL2TPD_SRC_VERSION 时同步更新:
+#   printf 'xl2tpd-x.y.z.tar.gz' | b2sum | cut -c1-2
+readonly XL2TPD_SRC_GENTOO_DIR="58"
+# 源码包候选地址：GitHub + 原样收录上游归档的发行版镜像 (国内 / 海外)。
+# 下载前并发测速排序，逐个尝试直到 SHA256 校验通过；HTTP 地址同样强制校验，内容无法被篡改
+readonly XL2TPD_SRC_MIRRORS=(
+    "https://github.com/xelerance/xl2tpd/archive/refs/tags/v${XL2TPD_SRC_VERSION}.tar.gz"
+    "https://codeload.github.com/xelerance/xl2tpd/tar.gz/refs/tags/v${XL2TPD_SRC_VERSION}"
+    "https://mirrors.aliyun.com/debian/pool/main/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.tuna.tsinghua.edu.cn/debian/pool/main/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.ustc.edu.cn/debian/pool/main/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.cloud.tencent.com/debian/pool/main/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.huaweicloud.com/debian/pool/main/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.aliyun.com/ubuntu/pool/universe/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/pool/universe/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.ustc.edu.cn/ubuntu/pool/universe/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.cloud.tencent.com/ubuntu/pool/universe/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.huaweicloud.com/ubuntu/pool/universe/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://mirrors.ustc.edu.cn/gentoo/distfiles/${XL2TPD_SRC_GENTOO_DIR}/${XL2TPD_SRC_TARBALL}"
+    "https://mirrors.tuna.tsinghua.edu.cn/gentoo/distfiles/${XL2TPD_SRC_GENTOO_DIR}/${XL2TPD_SRC_TARBALL}"
+    "https://mirrors.aliyun.com/gentoo/distfiles/${XL2TPD_SRC_GENTOO_DIR}/${XL2TPD_SRC_TARBALL}"
+    "https://mirrors.nju.edu.cn/gentoo/distfiles/${XL2TPD_SRC_GENTOO_DIR}/${XL2TPD_SRC_TARBALL}"
+    "https://deb.debian.org/debian/pool/main/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+    "https://distfiles.gentoo.org/distfiles/${XL2TPD_SRC_GENTOO_DIR}/${XL2TPD_SRC_TARBALL}"
+    "https://distfiles.alpinelinux.org/distfiles/edge/${XL2TPD_SRC_TARBALL}"
+    "http://archive.ubuntu.com/ubuntu/pool/universe/x/xl2tpd/${XL2TPD_SRC_ORIG}"
+)
 readonly XL2TPD_SRC_BIN="/usr/local/sbin/xl2tpd"
 readonly XL2TPD_SRC_CTL="/usr/local/sbin/xl2tpd-control"
 
@@ -150,6 +179,7 @@ PREV_XL2TPD_PRE=""
 
 TMP_DIR=""
 POLICY_RC_CREATED=0
+CURL_RETRY_ALL=0
 
 # ----------------------------------------------------------------------------
 # 输出
@@ -340,7 +370,9 @@ L2TP/IPsec VPN 一键部署脚本 v${SCRIPT_VERSION} (libreswan + xl2tpd)
 
 环境变量 (优先级低于命令行参数):
   VPN_USER  VPN_PASSWORD  VPN_IPSEC_PSK  VPN_NET  VPN_DNS  VPN_MTU  VPN_IFACE
-  XL2TPD_SRC_URL  (xl2tpd 源码下载地址，可指向内网镜像，SHA256 仍强制校验)
+  XL2TPD_SRC_URL   源码包下载地址，最先尝试，失败后仍回退到内置镜像 (SHA256 强制校验)
+  XL2TPD_SRC_FILE  本地源码包路径 (离线部署：先上传 ${XL2TPD_SRC_TARBALL}，SHA256 强制校验)
+  未指定时自动并发测速国内外 ${#XL2TPD_SRC_MIRRORS[@]} 个镜像，按速度依次尝试
 
 示例:
   sudo bash $0
@@ -671,6 +703,17 @@ pkg_installed() {
     esac
 }
 
+# 软件源中是否存在可安装的候选版本；确定不存在时不再重试，直接走后备方案
+pkg_has_candidate() {
+    local out re='Candidate: *([^[:space:]]+)'
+    case $PKG_MGR in
+        apt)
+            out=$(apt-cache policy "$1" 2>/dev/null || true)
+            [[ $out =~ $re ]] && [[ ${BASH_REMATCH[1]} != "(none)" ]] ;;
+        *)  return 0 ;;
+    esac
+}
+
 # Debian 系安装软件包时阻止服务被自动拉起 (默认配置下启动无意义且可能报错)
 block_service_autostart() {
     if [[ ! -e /usr/sbin/policy-rc.d ]]; then
@@ -708,15 +751,147 @@ enable_epel() {
     esac
 }
 
+# curl 是否支持某个选项 (先取完整帮助再匹配，避免 grep -q 提前退出触发 SIGPIPE + pipefail)
+curl_supports() {
+    local help
+    help=$(curl --help all 2>/dev/null || true)
+    [[ $help == *"$1"* ]]
+}
+
+# 下载单个地址；$3=1 为快速模式 (用于测速未响应的地址：不重试、缩短连接超时，出网受阻时不长时间空等)。
+# --retry-all-errors (curl 7.71+) 让 TLS 握手 / 传输被中途重置 (curl 35/56，国内访问海外站点常见)
+# 也能重试；20 秒内速度低于 1KB/s 视为卡死，立即放弃以便切换镜像
 download_file() {
-    local url=$1 out=$2
+    local url=$1 out=$2 quick=${3:-0} opts=()
+    rm -f -- "$out"
     if has_cmd curl; then
-        curl -fL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 600 -sS -o "$out" "$url"
+        opts=(-fL -sS --max-time 300 --speed-limit 1024 --speed-time 20)
+        if (( quick )); then
+            opts+=(--connect-timeout 5)
+        else
+            opts+=(--connect-timeout 10 --retry 2 --retry-delay 2)
+            if (( CURL_RETRY_ALL )); then
+                opts+=(--retry-all-errors)
+            fi
+        fi
+        curl "${opts[@]}" -o "$out" "$url"
     elif has_cmd wget; then
-        wget -q --tries=3 --timeout=30 -O "$out" "$url"
+        if (( quick )); then
+            wget -q --tries=1 --timeout=10 -O "$out" "$url"
+        else
+            wget -q --tries=3 --timeout=20 -O "$out" "$url"
+        fi
     else
-        die "缺少 curl / wget，无法下载源码"
+        return 127
     fi
+}
+
+# 并发测速：每个地址一个后台 curl 只取首字节 (Range 0-0)，总耗时取决于最慢的超时 (<= 8 秒)。
+# 每行输出 "<状态> <地址>"：ok 为可达 (按耗时升序)，na 为测速未响应 (保留作兜底)，- 为未测速
+rank_urls() {
+    local dir=$1 i t idx seen=" "
+    shift
+    local urls=("$@") pids=()
+    if ! has_cmd curl; then
+        printf -- '- %s\n' "${urls[@]}"
+        return 0
+    fi
+    mkdir -p -- "$dir"
+    for i in "${!urls[@]}"; do
+        (
+            if t=$(curl -fsS -L -r 0-0 -o /dev/null --connect-timeout 5 --max-time 8 \
+                    -w '%{time_total}' "${urls[i]}" 2>/dev/null); then
+                printf '%s %s\n' "$t" "$i" >"${dir}/${i}"
+            fi
+        ) &
+        pids+=("$!")
+    done
+    for i in "${pids[@]}"; do
+        wait "$i" || true
+    done
+    while read -r t idx; do
+        [[ $idx =~ ^[0-9]+$ && -n ${urls[idx]:-} ]] || continue
+        printf 'ok %s\n' "${urls[idx]}"
+        seen+="${idx} "
+    done < <(cat -- "$dir"/* 2>/dev/null | sort -n -k1,1 -k2,2n || true)
+    for i in "${!urls[@]}"; do
+        if [[ $seen != *" ${i} "* ]]; then
+            printf 'na %s\n' "${urls[i]}"
+        fi
+    done
+}
+
+# 获取 xl2tpd 源码包到 $1：XL2TPD_SRC_FILE (本地) > XL2TPD_SRC_URL > 内置镜像 (并发测速排序)。
+# 逐个地址尝试直到 SHA256 校验通过，单个镜像被阻断 / 限速 / 劫持都会自动切换到下一个
+fetch_xl2tpd_source() {
+    local out=$1 url state i urls=() quick=() added=0 reachable=0 total
+    if [[ -n ${XL2TPD_SRC_FILE:-} ]]; then
+        [[ -f $XL2TPD_SRC_FILE && -r $XL2TPD_SRC_FILE ]] \
+            || die "XL2TPD_SRC_FILE 指定的文件不存在或不可读: ${XL2TPD_SRC_FILE}"
+        verify_sha256 "$XL2TPD_SRC_FILE" "$XL2TPD_SRC_SHA256" \
+            || die "XL2TPD_SRC_FILE SHA256 校验失败 (需要原始的 ${XL2TPD_SRC_TARBALL}): ${XL2TPD_SRC_FILE}"
+        cp -f -- "$XL2TPD_SRC_FILE" "$out"
+        log_info "使用本地源码包: ${XL2TPD_SRC_FILE} (SHA256 校验通过)"
+        return 0
+    fi
+
+    has_cmd curl || has_cmd wget || die "缺少 curl / wget，无法下载源码 (可通过 XL2TPD_SRC_FILE 指定本地源码包)"
+    CURL_RETRY_ALL=0
+    if has_cmd curl && curl_supports --retry-all-errors; then
+        CURL_RETRY_ALL=1
+    fi
+
+    if [[ -n ${XL2TPD_SRC_URL:-} ]]; then
+        urls+=("$XL2TPD_SRC_URL")
+        quick+=(0)
+    fi
+    log_info "并发测速 ${#XL2TPD_SRC_MIRRORS[@]} 个源码镜像..."
+    while read -r state url; do
+        [[ -n $url && $url != "${XL2TPD_SRC_URL:-}" ]] || continue
+        urls+=("$url")
+        added=$((added + 1))
+        if [[ $state == "na" ]]; then
+            quick+=(1)
+        else
+            quick+=(0)
+        fi
+        if [[ $state == "ok" ]]; then
+            reachable=$((reachable + 1))
+        fi
+    done < <(rank_urls "${TMP_DIR}/probe" "${XL2TPD_SRC_MIRRORS[@]}")
+    if (( added == 0 )); then
+        for url in "${XL2TPD_SRC_MIRRORS[@]}"; do
+            urls+=("$url")
+            quick+=(0)
+        done
+    fi
+    if (( reachable > 0 )); then
+        log_info "测速完成: ${reachable}/${#XL2TPD_SRC_MIRRORS[@]} 个镜像可达，按响应速度依次尝试"
+    elif has_cmd curl; then
+        log_warn "测速未发现可达镜像 (出网可能受限)，仍逐个快速尝试"
+    fi
+
+    total=${#urls[@]}
+    for i in "${!urls[@]}"; do
+        url=${urls[i]}
+        log_info "下载源码 ($((i + 1))/${total}): ${url}"
+        if ! download_file "$url" "$out" "${quick[i]}"; then
+            log_warn "下载失败，切换下一个地址"
+            continue
+        fi
+        if verify_sha256 "$out" "$XL2TPD_SRC_SHA256"; then
+            log_info "SHA256 校验通过"
+            return 0
+        fi
+        log_warn "SHA256 不一致 (文件损坏、被劫持或不是原始源码包)，切换下一个地址"
+    done
+
+    rm -f -- "$out"
+    log_error "全部 ${total} 个源码地址均下载失败，请检查服务器出网 (DNS / 防火墙 / 安全组出站规则)，或:"
+    log_error "  1) 指定可访问的地址: XL2TPD_SRC_URL=<URL> bash $0"
+    log_error "  2) 离线部署: 上传 ${XL2TPD_SRC_TARBALL} 后执行 XL2TPD_SRC_FILE=<文件路径> bash $0"
+    log_error "     (SHA256 ${XL2TPD_SRC_SHA256})"
+    exit 1
 }
 
 verify_sha256() {
@@ -732,7 +907,7 @@ verify_sha256() {
 }
 
 build_xl2tpd_from_source() {
-    local url=${XL2TPD_SRC_URL:-$XL2TPD_SRC_URL_DEFAULT} tarball src jobs log
+    local tarball src jobs log
     log_info "源码编译 xl2tpd v${XL2TPD_SRC_VERSION}"
     case $PKG_MGR in
         apt)     retry 3 10 pkg_install gcc make libc6-dev linux-libc-dev tar gzip curl ;;
@@ -744,15 +919,12 @@ build_xl2tpd_from_source() {
     done
 
     TMP_DIR=$(mktemp -d /tmp/l2tp-build.XXXXXX)
-    tarball="${TMP_DIR}/xl2tpd-${XL2TPD_SRC_VERSION}.tar.gz"
+    tarball="${TMP_DIR}/${XL2TPD_SRC_TARBALL}"
     src="${TMP_DIR}/xl2tpd-${XL2TPD_SRC_VERSION}"
     log="${TMP_DIR}/build.log"
     jobs=$(cpu_count)
 
-    log_info "下载: ${url}"
-    download_file "$url" "$tarball" || die "源码下载失败: ${url} (可通过 XL2TPD_SRC_URL 指定镜像地址)"
-    verify_sha256 "$tarball" "$XL2TPD_SRC_SHA256" || die "源码 SHA256 校验失败，文件可能被篡改或损坏"
-    log_info "SHA256 校验通过"
+    fetch_xl2tpd_source "$tarball"
     tar -xzf "$tarball" -C "$TMP_DIR"
     [[ -d $src ]] || die "源码解压失败"
 
@@ -798,12 +970,17 @@ install_packages() {
     case $PKG_MGR in
         apt)
             retry 3 10 apt_update || log_warn "apt-get update 失败，尝试使用现有软件源索引继续"
+            pkg_has_candidate libreswan \
+                || die "当前系统软件源未收录 libreswan (Ubuntu 18.04+ / Debian 10+ 软件源均提供；Ubuntu 需启用 universe 源)"
             block_service_autostart
             if ! retry 3 10 pkg_install ca-certificates curl iproute2 procps kmod iptables ppp libreswan; then
                 unblock_service_autostart
                 die "安装 libreswan/ppp 失败 (Ubuntu 18.04+ / Debian 10+ 软件源均提供；Ubuntu 需启用 universe 源)"
             fi
             if (( OPT_FORCE_SOURCE )); then
+                build_xl2tpd_from_source
+            elif ! pkg_has_candidate xl2tpd; then
+                log_warn "当前系统软件源未收录 xl2tpd，改为源码编译"
                 build_xl2tpd_from_source
             elif retry 2 10 pkg_install xl2tpd; then
                 XL2TPD_ORIGIN="package"

@@ -6,7 +6,7 @@ Linux 服务端一键部署脚本：**SOCKS5 代理**（Dante）与 **L2TP/IPsec
 
 | 脚本 | 部署的服务 | 底层组件 | 认证方式 | 默认端口 |
 | --- | --- | --- | --- | --- |
-| [`socks5.sh`](socks5.sh) | SOCKS5 代理 | Dante `sockd` ≥ 1.4（缺包时源码编译 1.4.4） | 用户名 + 密码（RFC 1929） | TCP 6666，UDP 中继 50000-59999 |
+| [`socks5.sh`](socks5.sh) | SOCKS5 代理 | Dante `sockd` ≥ 1.4（缺包时源码编译 1.4.4） | 用户名 + 密码（RFC 1929） | TCP 1080，UDP 中继 50000-59999 |
 | [`l2tp.sh`](l2tp.sh) | L2TP/IPsec VPN | libreswan ≥ 3.19 + xl2tpd（缺包时源码编译 1.3.20） | IPsec PSK + 用户名/密码（MS-CHAPv2） | UDP 500 / 4500 / 1701 |
 
 ---
@@ -29,7 +29,7 @@ Linux 服务端一键部署脚本：**SOCKS5 代理**（Dante）与 **L2TP/IPsec
 建议**先下载再执行**：脚本会把自身安装为管理命令（`socks5ctl` / `l2tpctl`），通过管道执行时无法安装该命令。
 
 ```bash
-# SOCKS5 代理：随机用户名/密码，端口 6666
+# SOCKS5 代理：随机用户名/密码，端口 1080
 curl -fsSL https://raw.githubusercontent.com/tmcoinup/proxy/main/socks5.sh -o socks5.sh
 sudo bash socks5.sh
 
@@ -89,7 +89,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/tmcoinup/proxy@main/l2tp.sh   -o l2tp.sh
 
 ```mermaid
 flowchart LR
-    C["客户端<br/>浏览器 / Clash / Proxifier"] -->|"TCP 6666<br/>RFC 1929 用户名密码"| D["Dante sockd<br/>-N 多主进程"]
+    C["客户端<br/>浏览器 / Clash / Proxifier"] -->|"TCP 1080<br/>RFC 1929 用户名密码"| D["Dante sockd<br/>-N 多主进程"]
     C -.->|"UDP ASSOCIATE<br/>端口段 50000-59999"| D
     D -->|"校验系统账号<br/>（组 socks5proxy）"| S[("/etc/shadow")]
     D -->|"external 出口网卡"| I(("Internet"))
@@ -115,7 +115,7 @@ flowchart LR
 | --- | --- | --- |
 | `-u, --user USER` | 认证用户名：小写字母 / 数字 / `_` / `-`，字母或 `_` 开头，最长 32，不能用 `root`、`nobody` 等系统保留名 | 随机，`u` + 7 位 |
 | `-p, --pass PASS` | 认证密码：1~255 位可见 ASCII，不含空格；少于 8 位会告警 | 随机 20 位字母数字 |
-| `-P, --port PORT` | TCP 监听端口 1~65535 | `6666` |
+| `-P, --port PORT` | TCP 监听端口 1~65535 | `1080`（重装时沿用上次端口） |
 | `--udp-range A-B` | UDP 中继端口段：1024~65535，至少 16 个端口，不能包含监听端口 | `50000-59999` |
 | `-i, --iface IFACE` | 指定外部出口网卡 | 自动识别 |
 | `--dns auto\|system\|D1[,D2]` | 代理端解析域名所用 DNS：`auto` 见 [DNS 自动选择](#dns-自动选择)；`system` 始终跟随系统；指定 1~2 个 IPv4 时仅对 Dante 生效。`system` 与指定地址在重装时沿用 | `auto` |
@@ -209,9 +209,9 @@ flowchart LR
 部署完成后输出：
 
 ```text
-代理链接:  socks5://<用户名>:<密码>@<服务器IP>:6666
-Telegram:  tg://socks?server=<服务器IP>&port=6666&user=<用户名>&pass=<密码>
-测试命令:  curl -x 'socks5://<用户名>:<密码>@<服务器IP>:6666' https://api.ipify.org
+代理链接:  socks5://<用户名>:<密码>@<服务器IP>:1080
+Telegram:  tg://socks?server=<服务器IP>&port=1080&user=<用户名>&pass=<密码>
+测试命令:  curl -x 'socks5://<用户名>:<密码>@<服务器IP>:1080' https://api.ipify.org
 ```
 
 游戏 / 语音等 UDP 流量需要客户端支持 SOCKS5 UDP，例如 Proxifier、Netch、SocksCap64。

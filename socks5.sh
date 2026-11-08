@@ -8,7 +8,7 @@
 #    * 自动识别外部出口网卡 (IPv4 / IPv6)
 #    * 用户名 + 密码认证 (RFC 1929)，允许任意来源 IP 连接
 #    * 用户名 / 密码默认随机生成，可通过参数或环境变量指定
-#    * 默认端口 6666，开机自启，异常自动重启
+#    * 默认端口 1080，开机自启，异常自动重启
 #    * 多主进程 (-N) 利用多核；内核网络调优 + 游戏优化 (UDP 转发 / 低延迟 / BBR)
 #    * 不保留任何服务日志
 #
@@ -19,7 +19,7 @@
 #    Alpine (OpenRC) / openSUSE / Arch          软件包，无则源码编译
 #
 #  用法
-#    bash socks5.sh                          安装：随机用户名密码，端口 6666
+#    bash socks5.sh                          安装：随机用户名密码，端口 1080
 #    bash socks5.sh -u alice -p 'S3cret_pw'  安装：指定用户名密码
 #    bash socks5.sh info | status | restart | uninstall
 #    bash socks5.sh -h                       查看全部参数
@@ -43,7 +43,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # 常量
 # ----------------------------------------------------------------------------
 readonly SCRIPT_VERSION="1.2.0"
-readonly DEFAULT_PORT=6666
+readonly DEFAULT_PORT=1080
 readonly DEFAULT_UDP_RANGE="50000-59999"
 
 # DNS 自动选择：优先服务器自身 DNS (公网地址且实测可递归解析)，否则使用兜底 DNS (按实测延迟择优)

@@ -42,9 +42,16 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # ----------------------------------------------------------------------------
 # 常量
 # ----------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.2.0"
 readonly DEFAULT_PORT=6666
 readonly DEFAULT_UDP_RANGE="50000-59999"
+
+# DNS 自动选择：优先服务器自身 DNS (公网地址且实测可递归解析)，否则使用兜底 DNS (按实测延迟择优)
+readonly DNS_FALLBACK=(223.5.5.5 119.29.29.29)
+readonly DNS_PROBE_NAME="www.baidu.com"
+readonly DNS_PROBE_TIMEOUT=2
+readonly RESOLVED_STUBS=" 127.0.0.53 127.0.0.54 "
+readonly RESOLVED_UPSTREAM_CONF="/run/systemd/resolve/resolv.conf"
 
 readonly DANTE_MIN_MAJOR=1
 readonly DANTE_MIN_MINOR=4
@@ -87,6 +94,9 @@ readonly OPENRC_SCRIPT="/etc/init.d/${SERVICE_NAME}"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-socks5-tuning.conf"
 readonly MODULES_FILE="/etc/modules-load.d/socks5-bbr.conf"
 readonly CTL_PATH="/usr/local/sbin/socks5ctl"
+# Dante 专用 DNS：经启动器在独立挂载命名空间中挂载为 /etc/resolv.conf，仅作用于 Dante
+readonly DNS_RESOLV_FILE="${STATE_DIR}/resolv.conf"
+readonly DNS_EXEC="/usr/local/sbin/socks5-dns-exec"
 readonly PROXY_GROUP="socks5proxy"
 readonly FW_TAG="socks5"
 readonly MAX_WORKERS=8
@@ -100,6 +110,7 @@ OPT_PASS="${SOCKS5_PASS:-}"
 OPT_PORT="${SOCKS5_PORT:-}"
 OPT_UDP_RANGE="${SOCKS5_UDP_RANGE:-}"
 OPT_IFACE="${SOCKS5_IFACE:-}"
+OPT_DNS="${SOCKS5_DNS:-}"
 OPT_TUNE=1
 OPT_RENEW=0
 OPT_FORCE_SOURCE=0
@@ -139,6 +150,12 @@ TUNED=0
 PUBLIC_IP4=""
 PUBLIC_IP6=""
 
+DNS_MODE=""
+DNS_ORIGIN=""
+DNS_SERVERS=()
+DNS_SYSTEM_INTACT=0
+DNS_OVERRIDE=0
+
 PREV_USER=""
 PREV_PASS=""
 PREV_PORT=""
@@ -147,6 +164,10 @@ PREV_ORIGIN=""
 PREV_BIN=""
 PREV_FIREWALL=""
 PREV_FW_ZONE=""
+PREV_DNS=""
+PREV_DNS_MODE=""
+PREV_DNS_ORIGIN=""
+PREV_DNS_OVERRIDE=""
 
 TMP_DIR=""
 POLICY_RC_CREATED=0
@@ -219,6 +240,13 @@ cpu_count() {
     printf '%s' "$n"
 }
 
+# 本次运行共用的临时目录 (EXIT 时统一清理)
+ensure_tmp_dir() {
+    if [[ -z $TMP_DIR || ! -d $TMP_DIR ]]; then
+        TMP_DIR=$(mktemp -d /tmp/socks5.XXXXXX)
+    fi
+}
+
 # 生成指定长度、指定字符集的随机串 (读取定长随机字节，避免 SIGPIPE 与 pipefail 冲突)
 rand_str() {
     local len=$1 charset=$2 out="" chunk
@@ -255,6 +283,27 @@ is_ipv4() {
     for o in "${BASH_REMATCH[@]:1}"; do
         (( 10#$o <= 255 )) || return 1
     done
+    return 0
+}
+
+# 公网单播 IPv4：排除本机 / 私有 / CGNAT (含云厂商内部 DNS 100.100.x) / 链路本地 /
+# 基准测试 (198.18/15，常见于 Fake-IP) / 文档保留 / 组播与保留地址
+is_public_ipv4() {
+    local o1 o2 o3 rest
+    is_ipv4 "$1" || return 1
+    IFS=. read -r o1 o2 o3 rest <<<"$1"
+    o1=$((10#$o1)); o2=$((10#$o2)); o3=$((10#$o3))
+    if (( o1 == 0 || o1 == 10 || o1 == 127 || o1 >= 224
+        || (o1 == 100 && o2 >= 64 && o2 <= 127)
+        || (o1 == 169 && o2 == 254)
+        || (o1 == 172 && o2 >= 16 && o2 <= 31)
+        || (o1 == 192 && o2 == 168)
+        || (o1 == 192 && o2 == 0 && (o3 == 0 || o3 == 2))
+        || (o1 == 198 && (o2 == 18 || o2 == 19))
+        || (o1 == 198 && o2 == 51 && o3 == 100)
+        || (o1 == 203 && o2 == 0 && o3 == 113) )); then
+        return 1
+    fi
     return 0
 }
 
@@ -322,6 +371,10 @@ SOCKS5 代理服务一键部署脚本 v${SCRIPT_VERSION} (基于 Dante)
   -P, --port PORT      监听端口   (默认 ${DEFAULT_PORT})
       --udp-range A-B  UDP 转发端口段 (默认 ${DEFAULT_UDP_RANGE}，游戏/语音等 UDP 流量使用)
   -i, --iface IFACE    指定外部出口网卡 (默认自动识别)
+      --dns auto|system|D1[,D2]
+                       代理端解析域名所用 DNS (默认 auto：优先服务器自身公网 DNS，不可用时
+                       在兜底 DNS ${DNS_FALLBACK[*]} 中按实测延迟择优；system：始终跟随系统；
+                       指定地址或 auto 选中兜底 DNS 时仅对 Dante 生效，不修改系统 DNS)
       --renew          重新随机生成用户名密码 (默认重装时沿用已有账号)
       --no-tune        跳过内核网络 / 游戏低延迟调优
       --source         强制源码编译 Dante v${DANTE_SRC_VERSION}
@@ -330,7 +383,7 @@ SOCKS5 代理服务一键部署脚本 v${SCRIPT_VERSION} (基于 Dante)
   -v, --version        显示版本
 
 环境变量 (优先级低于命令行参数):
-  SOCKS5_USER  SOCKS5_PASS  SOCKS5_PORT  SOCKS5_UDP_RANGE  SOCKS5_IFACE
+  SOCKS5_USER  SOCKS5_PASS  SOCKS5_PORT  SOCKS5_UDP_RANGE  SOCKS5_IFACE  SOCKS5_DNS
   DANTE_SRC_URL   源码包下载地址，最先尝试，失败后仍回退到内置镜像 (SHA256 强制校验)
   DANTE_SRC_FILE  本地源码包路径 (离线部署：先上传 ${DANTE_SRC_TARBALL}，SHA256 强制校验)
   未指定时自动并发测速国内外 ${#DANTE_SRC_MIRRORS[@]} 个镜像，按速度依次尝试
@@ -362,6 +415,8 @@ parse_args() {
             --udp-range=*)  OPT_UDP_RANGE=${1#*=} ;;
             -i|--iface)     need_arg "$1" $#; OPT_IFACE=$2; shift ;;
             --iface=*)      OPT_IFACE=${1#*=} ;;
+            --dns)          need_arg "$1" $#; OPT_DNS=$2; shift ;;
+            --dns=*)        OPT_DNS=${1#*=} ;;
             --renew)        OPT_RENEW=1 ;;
             --no-tune)      OPT_TUNE=0 ;;
             --source)       OPT_FORCE_SOURCE=1 ;;
@@ -508,6 +563,10 @@ load_state() {
             DANTE_BIN)        PREV_BIN=$val ;;
             FIREWALL_KIND)    PREV_FIREWALL=$val ;;
             FIREWALL_ZONE)    PREV_FW_ZONE=$val ;;
+            SOCKS5_DNS)          PREV_DNS=$val ;;
+            SOCKS5_DNS_MODE)     PREV_DNS_MODE=$val ;;
+            SOCKS5_DNS_ORIGIN)   PREV_DNS_ORIGIN=$val ;;
+            SOCKS5_DNS_OVERRIDE) PREV_DNS_OVERRIDE=$val ;;
         esac
     done <"$STATE_FILE"
 }
@@ -527,6 +586,10 @@ save_state() {
         printf 'DANTE_VERSION=%s\n' "$DANTE_VERSION"
         printf 'FIREWALL_KIND=%s\n' "$FIREWALL_KIND"
         printf 'FIREWALL_ZONE=%s\n' "$FIREWALL_ZONE"
+        printf 'SOCKS5_DNS=%s\n' "$(IFS=,; printf '%s' "${DNS_SERVERS[*]:-}")"
+        printf 'SOCKS5_DNS_MODE=%s\n' "$DNS_MODE"
+        printf 'SOCKS5_DNS_ORIGIN=%s\n' "$DNS_ORIGIN"
+        printf 'SOCKS5_DNS_OVERRIDE=%s\n' "$DNS_OVERRIDE"
         printf 'TUNED=%s\n' "$TUNED"
         printf 'INIT_SYS=%s\n' "$INIT_SYS"
         printf 'UPDATED_AT=%s\n' "$(date '+%F %T %z')"
@@ -939,7 +1002,7 @@ build_dante_from_source() {
     log_info "源码编译 Dante v${DANTE_SRC_VERSION}"
     install_build_deps
 
-    TMP_DIR=$(mktemp -d /tmp/socks5-build.XXXXXX)
+    ensure_tmp_dir
     tarball="${TMP_DIR}/${DANTE_SRC_TARBALL}"
     src="${TMP_DIR}/dante-${DANTE_SRC_VERSION}"
     log="${TMP_DIR}/build.log"
@@ -1151,6 +1214,403 @@ detect_egress() {
         log_info "IPv6 出网: 不可用，Dante 出口限定为 IPv4 (保证域名请求正常解析与连接)"
     fi
     log_info "监听协议栈: $( (( LISTEN_V4 )) && printf 'IPv4 ')$( (( LISTEN_V6 )) && printf 'IPv6')"
+}
+
+# ----------------------------------------------------------------------------
+# DNS 自动选择 (代理端解析域名)
+#   客户端以域名发起请求时 (socks5h / 浏览器 / Clash 等)，由 Dante 经系统解析器 (getaddrinfo) 解析
+#   1. 优先服务器自身 DNS：须为公网 IPv4 且实测可递归解析 (systemd-resolved 的 127.0.0.53
+#      换成其实际上游判定)；全部合格时 Dante 原样使用系统解析配置，保留本地缓存
+#   2. 自身 DNS 不可用时，在兜底 DNS 223.5.5.5 / 119.29.29.29 中按实测延迟择优
+#   需要换用其他 DNS 时，经启动器在独立挂载命名空间中为 Dante 挂载专用 resolv.conf，
+#   只影响 Dante 进程，不修改系统 DNS 配置 (不与 systemd-resolved / NetworkManager / DHCP 冲突)
+#   全部候选并发探测，总耗时取决于最慢的超时；探测经 bash /dev/udp 直接收发 DNS 报文，
+#   不依赖 dig / nslookup 等外部工具
+# ----------------------------------------------------------------------------
+# 当前时间 (微秒)：bash 5+ 用 EPOCHREALTIME，否则用 date +%s%N
+now_us() {
+    local t
+    if [[ -n ${EPOCHREALTIME:-} ]]; then
+        t=${EPOCHREALTIME//[!0-9]/}
+        printf '%s' "$t"
+        return 0
+    fi
+    t=$(date +%s%N 2>/dev/null || true)
+    if [[ $t =~ ^[0-9]{16,}$ ]]; then
+        printf '%s' "$(( t / 1000 ))"
+    else
+        printf '%s' "$(( $(date +%s) * 1000000 ))"
+    fi
+}
+
+# 微秒 -> "12.3 ms"
+fmt_ms() {
+    printf '%d.%d ms' "$(( $1 / 1000 ))" "$(( $1 % 1000 / 100 ))"
+}
+
+# 单次 DNS 查询 (A 记录)。应答有效 (事务 ID 一致、QR=1、RA=1、RCODE=NOERROR、应答数 > 0)
+# 时输出往返耗时 (微秒)，否则返回 1
+dns_query_once() {
+    local ip=$1 bs='\x' id_hi id_lo id_hex fmt label t0 t1 hex flags ancount
+    # 事务 ID 字节限定 0x20~0x7e：bash 内建 printf 行缓冲输出，报文中出现 0x0a 会被拆成两个 UDP 包
+    id_hi=$(( RANDOM % 95 + 32 ))
+    id_lo=$(( RANDOM % 95 + 32 ))
+    printf -v id_hex '%02x%02x' "$id_hi" "$id_lo"
+    # 转义前缀 \x 经 %s 传入：bash 5.3 对格式串中的 "\\x" 会误报 missing hex digit
+    printf -v fmt '%s%02x%s%02x' "$bs" "$id_hi" "$bs" "$id_lo"
+    fmt+='\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+    for label in ${DNS_PROBE_NAME//./ }; do
+        printf -v fmt '%s%s%02x%s' "$fmt" "$bs" "${#label}" "$label"
+    done
+    fmt+='\x00\x00\x01\x00\x01'
+
+    t0=$(now_us)
+    # shellcheck disable=SC2059
+    hex=$( { ( exec 3<>"/dev/udp/${ip}/53" && printf "$fmt" >&3 \
+                && exec timeout "$DNS_PROBE_TIMEOUT" head -c 12 <&3 ) 2>/dev/null || true; } \
+            | od -An -tx1 -v | tr -d ' \n' ) || true
+    t1=$(now_us)
+
+    # 报文头 12 字节: ID(2) FLAGS(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
+    [[ ${#hex} -eq 24 && ${hex:0:4} == "$id_hex" ]] || return 1
+    flags=$(( 16#${hex:4:4} ))
+    ancount=$(( 16#${hex:12:4} ))
+    (( (flags & 0x8000) != 0 && (flags & 0x0080) != 0 && (flags & 0x000f) == 0 && ancount > 0 )) || return 1
+    printf '%s' "$(( t1 - t0 ))"
+}
+
+# 探测单个 DNS：最多 3 次查询，2 次成功或 2 次失败即结束；输出成功查询中的最小耗时 (微秒)
+dns_probe() {
+    local ip=$1 rtt best="" ok=0 fail=0
+    while (( ok < 2 && fail < 2 )); do
+        if rtt=$(dns_query_once "$ip"); then
+            ok=$((ok + 1))
+            if [[ -z $best ]] || (( rtt < best )); then
+                best=$rtt
+            fi
+        else
+            fail=$((fail + 1))
+        fi
+    done
+    [[ -n $best ]] || return 1
+    printf '%s' "$best"
+}
+
+# 并发探测一组 DNS，每行输出 "<耗时微秒> <地址>" 并按耗时升序；无有效应答的地址不输出
+dns_probe_all() {
+    local dir=$1 i rtt
+    shift
+    local ips=("$@") pids=()
+    rm -rf -- "$dir"
+    mkdir -p -- "$dir"
+    for i in "${!ips[@]}"; do
+        (
+            if rtt=$(dns_probe "${ips[i]}"); then
+                printf '%s %s\n' "$rtt" "${ips[i]}" >"${dir}/${i}"
+            fi
+        ) &
+        pids+=("$!")
+    done
+    for i in "${pids[@]}"; do
+        wait "$i" || true
+    done
+    cat -- "$dir"/* 2>/dev/null | sort -n -k1,1 || true
+}
+
+resolv_nameservers() {
+    [[ -r $1 ]] || return 0
+    awk '$1 == "nameserver" && NF >= 2 { print $2 }' "$1" 2>/dev/null || true
+}
+
+# 服务器自身 DNS (去重保序)。systemd-resolved 本地存根 (127.0.0.53 / 127.0.0.54) 替换为其实际上游；
+# 上游未知时保留存根地址 (非公网地址，随后判定为不可用)
+system_dns_servers() {
+    local ns up seen=" "
+    local -a raw=() upstream=()
+    mapfile -t raw < <(resolv_nameservers /etc/resolv.conf)
+    mapfile -t upstream < <(resolv_nameservers "$RESOLVED_UPSTREAM_CONF")
+    for ns in ${raw[@]+"${raw[@]}"}; do
+        if [[ $RESOLVED_STUBS == *" ${ns} "* ]] && (( ${#upstream[@]} > 0 )); then
+            for up in "${upstream[@]}"; do
+                if [[ $seen != *" ${up} "* ]]; then
+                    printf '%s\n' "$up"
+                    seen+="${up} "
+                fi
+            done
+        elif [[ $seen != *" ${ns} "* ]]; then
+            printf '%s\n' "$ns"
+            seen+="${ns} "
+        fi
+    done
+}
+
+# 结果写入:
+#   DNS_SERVERS        选定的 DNS (有序，至多 2 个)
+#   DNS_ORIGIN         system        服务器自身 DNS
+#                      system_backup 服务器自身 DNS 仅 1 个可用，补充最快的兜底 DNS 作备用
+#                      fallback      自身 DNS 不可用，兜底 DNS 按实测延迟升序
+#                      unverified    全部候选均无应答 (出网 UDP 53 受限等)：自身 DNS 为公网地址则沿用，
+#                                    否则按默认顺序使用兜底 DNS
+#   DNS_SYSTEM_INTACT  1 = 服务器自身 DNS 全部为公网地址且可用，可原样使用
+select_dns() {
+    local ns ip rtt
+    local -a sys=() sys_public=() cand=() sys_ok=() fb_ok=()
+    local -A rtt_of=()
+    DNS_SERVERS=()
+    DNS_ORIGIN=""
+    DNS_SYSTEM_INTACT=0
+
+    mapfile -t sys < <(system_dns_servers)
+    if (( ${#sys[@]} > 0 )); then
+        log_info "服务器自身 DNS: ${sys[*]}"
+    else
+        log_warn "未从 /etc/resolv.conf 读取到服务器自身 DNS"
+    fi
+    for ns in ${sys[@]+"${sys[@]}"}; do
+        if is_public_ipv4 "$ns"; then
+            sys_public+=("$ns")
+        else
+            log_info "  ${ns}: 非公网 IPv4 地址 (本机 / 内网 / 云厂商内部)，不予采用"
+        fi
+    done
+    for ip in ${sys_public[@]+"${sys_public[@]}"} "${DNS_FALLBACK[@]}"; do
+        if [[ " ${cand[*]:-} " != *" ${ip} "* ]]; then
+            cand+=("$ip")
+        fi
+    done
+
+    if has_cmd timeout && has_cmd od; then
+        ensure_tmp_dir
+        log_info "并发探测 ${#cand[@]} 个 DNS 的可用性与延迟..."
+        while read -r rtt ip; do
+            if [[ $rtt =~ ^[0-9]+$ && -n $ip ]]; then
+                rtt_of[$ip]=$rtt
+            fi
+        done < <(dns_probe_all "${TMP_DIR}/dns-probe" "${cand[@]}")
+        for ip in "${cand[@]}"; do
+            if [[ -n ${rtt_of[$ip]:-} ]]; then
+                log_info "  ${ip}: $(fmt_ms "${rtt_of[$ip]}")"
+            else
+                log_info "  ${ip}: 无有效应答"
+            fi
+        done
+    else
+        log_warn "缺少 timeout / od 命令，无法探测 DNS"
+    fi
+
+    for ns in ${sys_public[@]+"${sys_public[@]}"}; do
+        if [[ -n ${rtt_of[$ns]:-} ]]; then
+            sys_ok+=("$ns")
+        fi
+    done
+    while read -r rtt ip; do
+        if [[ -n $ip ]]; then
+            fb_ok+=("$ip")
+        fi
+    done < <(for ip in "${DNS_FALLBACK[@]}"; do
+                 if [[ -n ${rtt_of[$ip]:-} ]]; then
+                     printf '%s %s\n' "${rtt_of[$ip]}" "$ip"
+                 fi
+             done | sort -n -k1,1)
+
+    if (( ${#rtt_of[@]} == 0 )); then
+        DNS_ORIGIN="unverified"
+        if (( ${#sys_public[@]} > 0 )); then
+            DNS_SERVERS=("${sys_public[@]:0:2}")
+            if (( ${#sys_public[@]} == ${#sys[@]} )); then
+                DNS_SYSTEM_INTACT=1
+            fi
+        else
+            DNS_SERVERS=("${DNS_FALLBACK[@]}")
+        fi
+        log_warn "全部 DNS 均无有效应答 (出网 UDP 53 可能受限)，无法实测，暂用: ${DNS_SERVERS[*]}"
+    elif (( ${#sys_ok[@]} > 0 )); then
+        DNS_ORIGIN="system"
+        DNS_SERVERS=("${sys_ok[@]:0:2}")
+        if (( ${#sys_ok[@]} == ${#sys[@]} )); then
+            DNS_SYSTEM_INTACT=1
+        fi
+        # 自身 DNS 仅 1 个可用时，补充最快的兜底 DNS 作备用，避免单点
+        for ip in ${fb_ok[@]+"${fb_ok[@]}"}; do
+            if (( ${#DNS_SERVERS[@]} >= 2 )); then
+                break
+            fi
+            if [[ " ${DNS_SERVERS[*]} " != *" ${ip} "* ]]; then
+                DNS_SERVERS+=("$ip")
+                DNS_ORIGIN="system_backup"
+            fi
+        done
+        log_info "服务器自身 DNS 为公网地址且可用，优先采用"
+    else
+        # 有应答但不含自身 DNS，说明应答来自兜底 DNS，fb_ok 必然非空
+        DNS_ORIGIN="fallback"
+        DNS_SERVERS=("${fb_ok[@]}")
+        log_info "服务器自身 DNS 不可用，采用兜底 DNS (按实测延迟排序)"
+    fi
+}
+
+validate_dns_list() {
+    local d
+    local -a arr=()
+    IFS=',' read -r -a arr <<<"$1"
+    (( ${#arr[@]} >= 1 && ${#arr[@]} <= 2 )) || die "DNS 需为 auto / system 或 1~2 个 IPv4 地址 (逗号分隔)"
+    for d in "${arr[@]}"; do
+        is_ipv4 "$d" || die "DNS 地址不合法: '$d'"
+    done
+    DNS_SERVERS=("${arr[@]}")
+}
+
+dns_info_text() {
+    local list=${DNS_SERVERS[*]:-} scope=""
+    if (( DNS_OVERRIDE )); then
+        scope="，仅作用于 Dante"
+    fi
+    case $DNS_ORIGIN in
+        system)        printf '%s (服务器自身 DNS，跟随系统配置)' "${list:-系统配置}" ;;
+        system_backup) printf '%s (服务器自身 DNS，兜底 DNS 作备用%s)' "$list" "$scope" ;;
+        fallback)      printf '%s (兜底 DNS，按实测延迟择优%s)' "$list" "$scope" ;;
+        unverified)    printf '%s (探测无应答未能实测%s)' "$list" "$scope" ;;
+        manual)        printf '%s (手动指定%s)' "$list" "$scope" ;;
+        *)             printf '跟随系统配置 /etc/resolv.conf' ;;
+    esac
+}
+
+# DNS 决策，优先级: --dns / SOCKS5_DNS > 上次部署时的 system / 手动指定 > 自动选择
+resolve_dns() {
+    log_step "选择代理端 DNS"
+    DNS_SERVERS=()
+    DNS_OVERRIDE=0
+    if [[ -n $OPT_DNS ]]; then
+        case ${OPT_DNS,,} in
+            auto)   DNS_MODE="auto" ;;
+            system) DNS_MODE="system" ;;
+            *)      DNS_MODE="manual"; validate_dns_list "$OPT_DNS" ;;
+        esac
+    elif [[ $PREV_DNS_MODE == "system" ]]; then
+        DNS_MODE="system"
+        log_info "沿用上次的 --dns system (恢复自动选择请加 --dns auto)"
+    elif [[ $PREV_DNS_MODE == "manual" && -n $PREV_DNS ]]; then
+        DNS_MODE="manual"
+        validate_dns_list "$PREV_DNS"
+        log_info "沿用上次手动指定的 DNS (恢复自动选择请加 --dns auto)"
+    else
+        DNS_MODE="auto"
+    fi
+
+    case $DNS_MODE in
+        auto)
+            select_dns
+            if (( DNS_SYSTEM_INTACT )); then
+                # 系统 DNS 全部合格：Dante 原样使用系统解析配置 (保留 systemd-resolved 等本地缓存)
+                mapfile -t DNS_SERVERS < <(system_dns_servers)
+                if [[ $DNS_ORIGIN == "system_backup" ]]; then
+                    DNS_ORIGIN="system"
+                fi
+            else
+                DNS_OVERRIDE=1
+            fi ;;
+        system)
+            DNS_ORIGIN="follow" ;;
+        manual)
+            DNS_ORIGIN="manual"
+            DNS_OVERRIDE=1 ;;
+    esac
+}
+
+# 隔离所需的 unshare 与 mount (util-linux / busybox)，缺失时尝试安装
+dns_isolation_tools() {
+    if ! has_cmd unshare; then
+        case $PKG_MGR in
+            apk) pkg_install util-linux-misc 2>/dev/null || pkg_install util-linux 2>/dev/null || true ;;
+            *)   pkg_install util-linux 2>/dev/null || true ;;
+        esac
+    fi
+    has_cmd unshare && has_cmd mount
+}
+
+# DNS 隔离启动器: socks5-dns-exec <命令> [参数...]
+# 在独立挂载命名空间中把专用 resolv.conf 挂载为 /etc/resolv.conf 后执行命令 (exec 链保持同一 PID，
+# systemd / supervise-daemon 照常监管)；挂载仅在该命名空间内可见，不影响系统其他进程
+write_dns_exec() {
+    local unshare_bin mount_bin tmp
+    unshare_bin=$(command -v unshare)
+    mount_bin=$(command -v mount)
+    tmp=$(mktemp "${DNS_EXEC}.XXXXXX")
+    cat >"$tmp" <<EOF
+#!/bin/sh
+${CONF_MARKER} v${SCRIPT_VERSION}，重新运行脚本会覆盖本文件
+# Dante DNS 隔离启动器：在独立挂载命名空间中把 ${DNS_RESOLV_FILE} 挂载为 /etc/resolv.conf，
+# 再执行参数中的命令。仅作用于该命令及其子进程，不修改系统 DNS 配置
+# 用法: ${DNS_EXEC} <命令> [参数...]
+set -eu
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+if [ "\${SOCKS5_DNS_NS:-}" != "1" ]; then
+    SOCKS5_DNS_NS=1
+    export SOCKS5_DNS_NS
+    exec ${unshare_bin} -m --propagation private -- "\$0" "\$@"
+fi
+unset SOCKS5_DNS_NS
+# /etc/resolv.conf 不存在 (含悬空符号链接) 时无挂载点，按系统现状继续启动
+if [ -e /etc/resolv.conf ]; then
+    ${mount_bin} -o bind ${DNS_RESOLV_FILE} /etc/resolv.conf
+fi
+# nss-resolve (Fedora / Arch 等) 会绕过 resolv.conf 直接查询 systemd-resolved，hosts 改为标准的 files dns
+if grep -Eq '^[[:space:]]*hosts:.*[[:space:]]resolve' /etc/nsswitch.conf 2>/dev/null; then
+    nss=\$(mktemp /run/socks5-nsswitch.XXXXXX)
+    sed -E 's/^[[:space:]]*hosts:.*/hosts: files dns/' /etc/nsswitch.conf >"\$nss"
+    chmod 644 "\$nss"
+    ${mount_bin} -o bind "\$nss" /etc/nsswitch.conf
+    rm -f "\$nss"
+fi
+exec "\$@"
+EOF
+    chmod 755 "$tmp"
+    mv -f "$tmp" "$DNS_EXEC"
+}
+
+write_dns_resolv() {
+    local tmp ns
+    install -d -m 700 "$STATE_DIR"
+    tmp=$(mktemp "${STATE_DIR}/.resolv.conf.XXXXXX")
+    {
+        printf '%s v%s，重新运行脚本会覆盖本文件\n' "$CONF_MARKER" "$SCRIPT_VERSION"
+        printf '# Dante 专用 DNS (经 %s 挂载到 Dante 的独立命名空间，不影响系统 DNS)\n' "$DNS_EXEC"
+        for ns in "${DNS_SERVERS[@]}"; do
+            printf 'nameserver %s\n' "$ns"
+        done
+        # 首选无应答时 2 秒即切换到备用 DNS (默认 5 秒)
+        printf 'options timeout:2 attempts:2\n'
+    } >"$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$DNS_RESOLV_FILE"
+}
+
+# 应用 DNS 决策：需要换用 DNS 时生成专用 resolv.conf 与启动器，并实测在独立命名空间中生效；
+# 环境不支持 (缺少 unshare / 无特权容器禁止 mount 等) 时回退为跟随系统 DNS
+setup_dns_isolation() {
+    if (( ! DNS_OVERRIDE )); then
+        rm -f "$DNS_EXEC" "$DNS_RESOLV_FILE"
+        log_info "代理端 DNS: $(dns_info_text)"
+        return 0
+    fi
+    if ! dns_isolation_tools; then
+        log_warn "缺少 unshare / mount，无法为 Dante 单独指定 DNS，改为跟随系统 DNS"
+    else
+        write_dns_resolv
+        write_dns_exec
+        # 自检：启动器内看到的 /etc/resolv.conf 必须是专用文件
+        if "$DNS_EXEC" grep -qF "$CONF_MARKER" /etc/resolv.conf >/dev/null 2>&1; then
+            log_info "代理端 DNS: $(dns_info_text)"
+            return 0
+        fi
+        log_warn "当前环境无法在独立命名空间中挂载 resolv.conf (如无特权容器)，改为跟随系统 DNS"
+    fi
+    rm -f "$DNS_EXEC" "$DNS_RESOLV_FILE"
+    DNS_OVERRIDE=0
+    DNS_ORIGIN="follow"
+    DNS_SERVERS=()
+    log_info "代理端 DNS: $(dns_info_text)"
 }
 
 # ----------------------------------------------------------------------------
@@ -1449,9 +1909,12 @@ disable_vendor_services() {
 }
 
 write_systemd_unit() {
-    local workers_arg=""
+    local workers_arg="" exec_prefix=""
     if (( WORKERS > 1 )); then
         workers_arg=" -N ${WORKERS}"
+    fi
+    if (( DNS_OVERRIDE )); then
+        exec_prefix="${DNS_EXEC} "
     fi
     cat >"$SYSTEMD_UNIT" <<EOF
 ${CONF_MARKER} v${SCRIPT_VERSION}
@@ -1465,7 +1928,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStartPre=${DANTE_BIN} -V -f ${CONF_FILE}
-ExecStart=${DANTE_BIN} -f ${CONF_FILE}${workers_arg}
+ExecStart=${exec_prefix}${DANTE_BIN} -f ${CONF_FILE}${workers_arg}
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=2
@@ -1500,9 +1963,14 @@ EOF
 }
 
 write_openrc_script() {
-    local workers_arg=""
+    local workers_arg="" command_line
     if (( WORKERS > 1 )); then
         workers_arg=" -N ${WORKERS}"
+    fi
+    if (( DNS_OVERRIDE )); then
+        command_line="command=\"${DNS_EXEC}\""$'\n'"command_args=\"${DANTE_BIN} -f ${CONF_FILE}${workers_arg}\""
+    else
+        command_line="command=\"${DANTE_BIN}\""$'\n'"command_args=\"-f ${CONF_FILE}${workers_arg}\""
     fi
     cat >"$OPENRC_SCRIPT" <<EOF
 #!/sbin/openrc-run
@@ -1510,8 +1978,7 @@ ${CONF_MARKER} v${SCRIPT_VERSION}
 
 name="danted"
 description="Dante SOCKS5 Proxy Server (managed by socks5.sh)"
-command="${DANTE_BIN}"
-command_args="-f ${CONF_FILE}${workers_arg}"
+${command_line}
 supervisor="supervise-daemon"
 supervise_daemon_args="--nicelevel -10"
 respawn_delay=2
@@ -1527,7 +1994,7 @@ depend() {
 }
 
 start_pre() {
-    "\${command}" -V -f "${CONF_FILE}" >/dev/null 2>&1 || {
+    "${DANTE_BIN}" -V -f "${CONF_FILE}" >/dev/null 2>&1 || {
         eerror "Dante 配置校验失败: ${CONF_FILE}"
         return 1
     }
@@ -2045,7 +2512,8 @@ verify_deployment() {
         log_info "出网自检通过 (域名目标，代理端解析)：出口 IP ${via_host}"
     fi
     if [[ -n $via_ip && -z $via_host ]]; then
-        log_warn "代理端域名解析失败：浏览器 / Clash 等以域名请求的客户端将无法访问，请检查服务器 DNS (/etc/resolv.conf)"
+        log_warn "代理端域名解析失败：浏览器 / Clash 等以域名请求的客户端将无法访问，当前 DNS: $(dns_info_text)"
+        log_warn "可用 --dns 指定可用的 DNS 后重新部署，例如: --dns ${DNS_FALLBACK[0]},${DNS_FALLBACK[1]}"
     elif [[ -z $via_ip && -z $via_host ]]; then
         log_warn "经代理访问公网检测站点失败 (可能是服务器限制出网或检测站点不可达)，不影响代理本身"
     fi
@@ -2124,6 +2592,7 @@ print_info() {
     kv "密码:" "$SOCKS_PASS" "$C_CYAN"
     kv "认证方式:" "用户名/密码 (RFC 1929)，允许任意来源 IP 连接"
     kv "UDP转发:" "已启用，端口段 ${UDP_RANGE}/udp (游戏 / 语音)"
+    kv "代理端DNS:" "$(dns_info_text)"
     printf '%s\n' "$thin"
     kv "代理链接:" "socks5://${eu}:${ep}@${url_host}:${SOCKS_PORT}"
     kv "Telegram:" "tg://socks?server=${host}&port=${SOCKS_PORT}&user=${eu}&pass=${ep}"
@@ -2158,6 +2627,7 @@ cmd_install() {
     install_base_deps
     install_dante
     detect_egress
+    resolve_dns
 
     # 停止旧实例后再检查端口占用
     if service_exists; then
@@ -2167,6 +2637,8 @@ cmd_install() {
     if port_listening "$SOCKS_PORT"; then
         die "端口 ${SOCKS_PORT} 已被占用 (进程: $(port_owner "$SOCKS_PORT"))，请使用 -P 指定其他端口"
     fi
+    # 旧实例停止后再替换 DNS 启动器，避免旧服务在替换期间被拉起时找不到启动器
+    setup_dns_isolation
 
     setup_proxy_account
     # 尽早落盘部署状态，保证中途失败时 uninstall 仍能完整清理
@@ -2193,6 +2665,14 @@ load_runtime_from_state() {
     UDP_RANGE=$PREV_UDP_RANGE
     DANTE_ORIGIN=$PREV_ORIGIN
     DANTE_BIN=$PREV_BIN
+    DNS_MODE=$PREV_DNS_MODE
+    DNS_ORIGIN=$PREV_DNS_ORIGIN
+    DNS_OVERRIDE=${PREV_DNS_OVERRIDE:-0}
+    [[ $DNS_OVERRIDE == "1" ]] || DNS_OVERRIDE=0
+    DNS_SERVERS=()
+    if [[ -n $PREV_DNS ]]; then
+        IFS=',' read -r -a DNS_SERVERS <<<"$PREV_DNS"
+    fi
     if [[ -x $DANTE_BIN ]]; then
         DANTE_VERSION=$(dante_version_of "$DANTE_BIN")
     fi
@@ -2332,7 +2812,7 @@ cmd_uninstall() {
     fi
 
     rm -rf "$STATE_DIR"
-    rm -f "$CTL_PATH"
+    rm -f "$CTL_PATH" "$DNS_EXEC"
     log_info "卸载完成"
 }
 

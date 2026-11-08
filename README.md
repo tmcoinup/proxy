@@ -17,6 +17,7 @@ Linux 服务端一键部署脚本：**SOCKS5 代理**（Dante）与 **L2TP/IPsec
 - [运行要求](#运行要求)
 - [socks5.sh — SOCKS5 代理](#socks5sh--socks5-代理)
 - [l2tp.sh — L2TP/IPsec VPN](#l2tpsh--l2tpipsec-vpn)
+- [DNS 自动选择](#dns-自动选择)
 - [内核网络调优](#内核网络调优)
 - [可靠性与安全设计](#可靠性与安全设计)
 - [常见问题](#常见问题)
@@ -117,13 +118,14 @@ flowchart LR
 | `-P, --port PORT` | TCP 监听端口 1~65535 | `6666` |
 | `--udp-range A-B` | UDP 中继端口段：1024~65535，至少 16 个端口，不能包含监听端口 | `50000-59999` |
 | `-i, --iface IFACE` | 指定外部出口网卡 | 自动识别 |
+| `--dns auto\|system\|D1[,D2]` | 代理端解析域名所用 DNS：`auto` 见 [DNS 自动选择](#dns-自动选择)；`system` 始终跟随系统；指定 1~2 个 IPv4 时仅对 Dante 生效。`system` 与指定地址在重装时沿用 | `auto` |
 | `--renew` | 重新随机生成用户名和密码 | 重装时沿用已有账号 |
 | `--no-tune` | 跳过内核网络调优 | 启用调优 |
 | `--source` | 强制源码编译 Dante 1.4.4 | 优先系统软件包 |
 | `-y, --yes` | 卸载时不再确认 | — |
 | `-h, --help` / `-v, --version` | 帮助 / 版本 | — |
 
-环境变量（优先级低于命令行参数）：`SOCKS5_USER`、`SOCKS5_PASS`、`SOCKS5_PORT`、`SOCKS5_UDP_RANGE`、`SOCKS5_IFACE`。
+环境变量（优先级低于命令行参数）：`SOCKS5_USER`、`SOCKS5_PASS`、`SOCKS5_PORT`、`SOCKS5_UDP_RANGE`、`SOCKS5_IFACE`、`SOCKS5_DNS`。
 
 源码包来源（均强制 SHA256 校验）：
 
@@ -149,12 +151,13 @@ flowchart LR
 2. **确定参数**：命令行 > 环境变量 > 上次部署状态 > 默认值，并做格式校验。
 3. **安装依赖与 Dante**：依次尝试复用上次源码编译的二进制、系统软件包（版本需 ≥ 1.4，过旧则卸载；软件源未收录则跳过）、源码编译（多镜像并发测速后依次下载，校验 SHA256）。
 4. **识别出口网卡**：按 `ip route get` 对 1.1.1.1 / 223.5.5.5 / 8.8.8.8 的实际路由决策识别，兼容策略路由与多网卡；同时实测 IPv6 能否出网。
-5. **端口检查**：先停止旧实例并停用发行版自带的 `sockd` / `dante-server` 服务，再检查端口占用。
-6. **配置账号**：创建或更新代理账号，密码统一用 SHA-512 crypt 写入；单账号模式，会清理旧的托管账号。
-7. **生成配置**：写入 `/etc/danted.conf`，并在替换前用 `sockd -V` 校验。
-8. **内核调优**、**注册服务**、**放行防火墙**。
-9. **启动并自检**：等待端口监听，再做认证与出网验证（见下文）。
-10. **打印连接信息**。
+5. **选择代理端 DNS**：见 [DNS 自动选择](#dns-自动选择)。
+6. **端口检查**：先停止旧实例并停用发行版自带的 `sockd` / `dante-server` 服务，再检查端口占用；需要换用 DNS 时随后生成 DNS 隔离启动器并实测生效。
+7. **配置账号**：创建或更新代理账号，密码统一用 SHA-512 crypt 写入；单账号模式，会清理旧的托管账号。
+8. **生成配置**：写入 `/etc/danted.conf`，并在替换前用 `sockd -V` 校验。
+9. **内核调优**、**注册服务**、**放行防火墙**。
+10. **启动并自检**：等待端口监听，再做认证与出网验证（见下文）。
+11. **打印连接信息**。
 
 部署状态在中途就会写入 `/etc/socks5/socks5.env`，所以即使安装失败，`uninstall` 也能完整清理。
 
@@ -195,7 +198,7 @@ flowchart LR
 | 正确密码能登录 | `curl --proxy socks5://` 完成 SOCKS5 握手 + RFC 1929 认证，随后请求被规则禁止的本机回环地址（不产生出网流量）；无 curl 时用 python3 原生 socket 兜底 | 中止部署 |
 | 错误密码被拒绝 | 用随机错误密码再认证一次，必须明确返回“认证被拒” | 中止部署（安全自检） |
 | 经代理出网（IP 目标） | `curl --proxy socks5://`，客户端本地解析域名 | 告警 |
-| 经代理出网（域名目标） | `curl --proxy socks5h://`，由代理端解析域名 | 告警并提示检查 `/etc/resolv.conf` |
+| 经代理出网（域名目标） | `curl --proxy socks5h://`，由代理端解析域名 | 告警，显示当前代理端 DNS 并提示用 `--dns` 指定 |
 
 自检过程中凭据通过环境变量或 curl 配置（stdin）传递，不会出现在进程参数里。
 
@@ -223,6 +226,7 @@ Telegram:  tg://socks?server=<服务器IP>&port=6666&user=<用户名>&pass=<密�
 | `/etc/sysctl.d/99-socks5-tuning.conf` | 内核调优参数 |
 | `/etc/modules-load.d/socks5-bbr.conf` | 开机加载 `tcp_bbr` |
 | `/usr/local/sbin/socks5ctl` | 管理命令（脚本自身副本） |
+| `/usr/local/sbin/socks5-dns-exec`、`/etc/socks5/resolv.conf` | DNS 隔离启动器与 Dante 专用 DNS（仅需要换用 DNS 时生成，见 [DNS 自动选择](#dns-自动选择)） |
 | `/usr/local/sbin/sockd` | 源码编译的 Dante（仅源码安装时） |
 | 系统组 `socks5proxy` 及其账号 | SOCKS5 认证账号 |
 
@@ -263,7 +267,7 @@ flowchart LR
 | `-p, --pass PASS` | VPN 密码：1~128 位可见 ASCII，不含空格、`"`、`\`、`'`；少于 8 位告警 | 随机 16 位 |
 | `-k, --psk PSK` | IPsec 预共享密钥，规则同密码；少于 12 位告警 | 随机 20 位 |
 | `--net A.B.C` | 客户端网段前缀（/24），必须是私有地址 | `192.168.42` |
-| `--dns D1[,D2]` | 下发给客户端的 DNS，1~2 个 IPv4 | `8.8.8.8,1.1.1.1` |
+| `--dns auto\|D1[,D2]` | 下发给客户端的 DNS：`auto` 见 [DNS 自动选择](#dns-自动选择)；或指定 1~2 个 IPv4（重装时沿用，`--dns auto` 恢复自动） | `auto` |
 | `--mtu N` | PPP MTU/MRU，1200~1460 | `1280` |
 | `-i, --iface IFACE` | 指定外部出口网卡 | 自动识别 |
 | `--renew` | 重新随机生成用户名、密码、PSK | 重装时沿用 |
@@ -289,7 +293,7 @@ xl2tpd 源码包来源（均强制 SHA256 校验，国内网络适配机制与 s
 ### 部署流程
 
 1. **环境识别**：发行版、架构、包管理器；检查容器环境与 `/dev/ppp`。
-2. **确定参数**并记录部署前是否已装有 libreswan / xl2tpd（卸载时保留这些软件）。
+2. **确定参数**、**选择客户端 DNS**（见 [DNS 自动选择](#dns-自动选择)），并记录部署前是否已装有 libreswan / xl2tpd（卸载时保留这些软件）。
 3. **安装软件**：先拦截已安装的 strongSwan（与 libreswan 互斥，apt 会静默卸载对方）；安装 libreswan、ppp、iptables（apt 软件源未收录 libreswan 时立即报错，不再重试）；xl2tpd 依次尝试系统源、EPEL、源码编译（多镜像并发测速后依次下载，校验 SHA256）。
 4. **版本检测**：确认 `ipsec` 实现是 libreswan 且版本 ≥ 3.19。
 5. **识别出口网卡与公网 IP**，检查客户端网段是否与本机网卡冲突；公网 IP 与网卡地址不同时判定为 NAT 后部署。
@@ -323,7 +327,7 @@ xl2tpd 源码包来源（均强制 SHA256 校验，国内网络适配机制与 s
 | 压缩 | `noccp`、`novj`、`novjccomp`：加密已由 IPsec 提供，关闭压缩以节省 CPU、降低延迟 |
 | MTU | `mtu` / `mru` 默认 1280，预留 IPsec + L2TP 封装开销，兼容 PPPoE 与移动网络 |
 | 存活检测 | `lcp-echo-interval 30`，`lcp-echo-failure 4` |
-| DNS | `ms-dns` 下发 1~2 个地址 |
+| DNS | `ms-dns` 下发 1~2 个地址（默认自动选择，见 [DNS 自动选择](#dns-自动选择)） |
 
 ### 防火墙与 NAT
 
@@ -351,7 +355,7 @@ iptables 模式使用 4 条专用链，规则幂等，`up` / `down` 可重复执
 
 ### 部署自检
 
-依次检查：ipsec 与 xl2tpd 服务运行中、UDP 500 / 4500 / 1701 已监听、IPsec 连接 `l2tp-psk` 已加载、IPv4 转发已开启、NAT 规则已生效（iptables 链或 firewalld masquerade）。任意一项失败即中止，并给出排查命令。
+依次检查：内核必需的 `xfrm_user` / `esp4` 模块可加载、ipsec 与 xl2tpd 服务运行中、UDP 500 / 4500 / 1701 已监听、IPsec 连接 `l2tp-psk` 已加载、IPv4 转发已开启、NAT 规则已生效（iptables 链或 firewalld masquerade）。任意一项失败即中止，并给出排查命令。必需模块会写入开机加载配置，IPsec 的 systemd 启动前检查也会核验它们；不会绕过管理员的 `modprobe install` 限制。
 
 ### 客户端配置
 
@@ -383,6 +387,41 @@ REG ADD HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent /v AssumeUDPEncapsula
 | `/usr/local/sbin/xl2tpd`、`xl2tpd-control` | 源码编译的 xl2tpd（仅源码安装时） |
 
 上述配置文件若在部署前已存在且不是本脚本生成的，会先备份为 `.bak.<时间戳>`；卸载时还原最近一份备份，部署前已安装的 libreswan / xl2tpd 会被保留并按原配置恢复运行。
+
+---
+
+## DNS 自动选择
+
+两个脚本都用到 DNS：
+
+| 脚本 | 用途 | 生效方式 |
+| --- | --- | --- |
+| socks5.sh | 客户端以域名发起请求时（socks5h、浏览器、Clash 等），由 Dante 在服务器上解析域名 | 系统 DNS 合格时 Dante 直接使用系统解析配置；否则只给 Dante 换用选定的 DNS |
+| l2tp.sh | 通过 PPP `ms-dns` 下发给 VPN 客户端；客户端的 DNS 查询经隧道由服务器 NAT 转发 | 写入 `/etc/ppp/options.xl2tpd` |
+
+默认 `--dns auto`，每次安装 / 重装都重新选择：
+
+1. **优先服务器自身 DNS**：读取 `/etc/resolv.conf`；如果是 systemd-resolved 的本地存根（`127.0.0.53` / `127.0.0.54`），改用 `/run/systemd/resolve/resolv.conf` 里的实际上游。只有**公网 IPv4 地址**并且**实测能递归解析**的才会采用。本机回环、私有网段、CGNAT（如阿里云内网 DNS `100.100.2.136`）、链路本地（如 AWS `169.254.169.253`）、Fake-IP 段 `198.18.0.0/15` 都不采用。
+2. **兜底 DNS**：服务器自身 DNS 不可用时，使用 `223.5.5.5` 和 `119.29.29.29`，按实测延迟排序，快的作首选，另一个作备用。
+3. **单点补齐**：服务器自身 DNS 只有 1 个可用时，补上最快的兜底 DNS 作备用。
+4. **无法实测**：所有候选都没有应答时（如出网 UDP 53 被封），服务器自身 DNS 是公网地址就沿用，否则按 `223.5.5.5`、`119.29.29.29` 的默认顺序使用，并给出告警。
+
+探测方式：所有候选并发探测，每个地址最多查询 3 次（2 次成功或 2 次失败即停止），取最小往返耗时。整个过程一般不到 1 秒，最慢约 4 秒。脚本直接用 bash `/dev/udp` 收发 DNS 报文，不依赖 dig / nslookup。只有事务 ID 一致、`QR=1`、`RA=1`（支持递归）、`RCODE=NOERROR` 且带应答记录的响应才算可用。
+
+> 腾讯云默认 DNS `183.60.83.19` / `183.60.82.98` 是公网地址，但只对腾讯云内部应答。从服务器上实测可用，所以会被采用。VPN 客户端的 DNS 查询经服务器 NAT 后，源地址就是服务器自身，同样可以使用（已在腾讯云 Debian 13 上模拟客户端经 MASQUERADE 实测）。
+
+**SOCKS5 的 DNS 隔离**：Dante 没有指定 DNS 服务器的配置项，只能使用系统解析器（getaddrinfo）。需要换用 DNS 时（auto 选中兜底 DNS，或用 `--dns` 指定地址），脚本不修改系统 DNS，以免与 systemd-resolved、NetworkManager、DHCP、cloud-init 冲突或被覆盖。做法如下：
+
+- 生成 Dante 专用的 `/etc/socks5/resolv.conf`，带 `options timeout:2 attempts:2`，首选 DNS 无应答时 2 秒内切换到备用。
+- 服务改由 `/usr/local/sbin/socks5-dns-exec` 启动：先 `unshare -m` 进入独立挂载命名空间，把专用文件 bind mount 到 `/etc/resolv.conf`，再 `exec` Dante。exec 链保持同一个 PID，systemd / OpenRC 照常监管，Dante 的全部子进程都在这个命名空间里，系统其他进程不受影响。
+- 系统使用 nss-resolve（Fedora / Arch 等，`hosts:` 行含 `resolve`）时，解析会绕过 resolv.conf，所以在同一命名空间里把 `hosts:` 改为 `files dns`。这一步在每次启动时根据当前的 `/etc/nsswitch.conf` 生成。
+- 部署时实测启动器内看到的是否为专用文件。环境不支持时（如缺少 `unshare`，或无特权容器禁止 mount），自动回退为跟随系统 DNS 并告警。
+
+在服务器上确认 Dante 实际使用的 DNS：
+
+```bash
+cat /proc/$(systemctl show -p MainPID --value danted)/root/etc/resolv.conf
+```
 
 ---
 
@@ -427,7 +466,7 @@ REG ADD HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent /v AssumeUDPEncapsula
 - **失败可清理**：部署状态在安装早期就写入，中途失败后 `uninstall` 仍能完整回滚。
 - **源码完整性**：源码包强制 SHA256 校验，镜像地址同样校验。
 - **凭据不进进程参数**：自检时凭据通过环境变量或 stdin 传给子进程。
-- **不破坏现有环境**：备份非本脚本生成的配置；拒绝修改已存在的非托管系统用户；检测到 strongSwan 即中止；Debian 系安装软件包时用 `policy-rc.d` 阻止服务以默认配置自动启动。
+- **不破坏现有环境**：备份非本脚本生成的配置；不修改系统 DNS（SOCKS5 换用 DNS 时只在 Dante 的独立挂载命名空间内生效）；拒绝修改已存在的非托管系统用户；检测到 strongSwan 即中止；Debian 系安装软件包时用 `policy-rc.d` 阻止服务以默认配置自动启动。
 - **网络操作重试**：软件包安装失败时自动重试（软件源确定未收录时不重试）；Dante / xl2tpd 源码多镜像并发测速、逐个回退，TLS 中途被重置也会重试。
 - **无日志**：Dante 不配置日志输出；libreswan、xl2tpd、pppd 的日志指向 `/dev/null`；systemd 服务丢弃标准输出与错误输出。
 
@@ -438,13 +477,15 @@ REG ADD HKLM\SYSTEM\CurrentControlSet\Services\PolicyAgent /v AssumeUDPEncapsula
 | 现象 | 原因与处理 |
 | --- | --- |
 | 部署成功但外网连不上 | 云服务器安全组未放行端口：SOCKS5 放行 TCP 端口 + UDP 端口段；L2TP 放行 UDP 500 / 4500 |
-| SOCKS5 以 IP 访问正常，以域名访问失败 | 服务器 DNS 异常，检查 `/etc/resolv.conf` |
+| SOCKS5 以 IP 访问正常，以域名访问失败 | 代理端 DNS 不可用。`socks5ctl info` 查看当前 DNS 及来源，用 `--dns 223.5.5.5,119.29.29.29` 指定可用的 DNS 后重新部署（只对 Dante 生效）；`--dns auto` 恢复自动选择 |
 | 提示端口已被占用 | 用 `-P` 换端口（SOCKS5）；L2TP 端口固定，需先停止占用 UDP 500 / 4500 / 1701 的服务 |
 | 提示用户已存在且不是本脚本创建 | 系统已有同名用户，为避免改动其密码，请用 `-u` 换用户名 |
 | 检测到 strongSwan | 与 libreswan 互斥，先手动卸载 strongSwan 再重试 |
 | 客户端网段与本机网卡冲突 | 用 `--net` 换网段，例如 `--net 10.66.66` |
 | IPsec 配置校验报 IKEv1 相关错误 | 当前发行版的 libreswan 编译时禁用了 IKEv1（L2TP/IPsec 必需），需更换发行版或使用官方源码构建的 libreswan |
-| Windows 连接 L2TP 报错 809 | 服务器在 NAT 后，按[客户端配置](#客户端配置)添加注册表项并重启 |
+| Windows 连接 L2TP 报错 789，服务端出现 `AddSA: Protocol not supported` | 检查 `modprobe -n -v esp4`、运行内核的模块文件及 `/etc/modprobe.d/`。`install esp4 /bin/false` 会阻止 ESP 加密会话建立；若是漏洞缓解规则，先确认正在运行的内核已修复，再调整必要规则，保留其他防护。只看 ipsec 服务为运行中不足以确认数据面正常 |
+| Windows 连接 L2TP 报错 809 | 先检查 UDP 500 / 4500、IKE/ESP 协商和防火墙。服务器与客户端均在 NAT 后时，按[客户端配置](#客户端配置)设置 `AssumeUDPEncapsulationContextOnSendRule=2`，并按微软文档重启客户端使其生效 |
+| VPN 已连接、DNS 正常，但公网出口检查失败 | 在 VPN 内使用下发的 DNS 解析检查域名，避免误用宿主机其他代理提供的 `198.18.0.0/15` Fake-IP；验证 HTTPS 证书，并读取检查服务返回的实际公网地址 |
 | 未检测到 `/dev/ppp` | 在 VPS 控制面板开启 PPP / TUN |
 | 系统软件源中没有 Dante / xl2tpd | 脚本会自动源码编译（如 Debian 13 未收录 `dante-server`）；内网环境可通过 `DANTE_SRC_URL` / `XL2TPD_SRC_URL` 指定镜像 |
 | 国内服务器下载 Dante / xl2tpd 源码报 `curl: (35)` / `curl: (56) ... unexpected eof` | 上游 inet.no / GitHub 在国内连接不稳定。脚本会自动测速并切换到国内镜像；若服务器完全无法出网，上传源码包后用 `DANTE_SRC_FILE=<路径>` / `XL2TPD_SRC_FILE=<路径>` 离线部署 |

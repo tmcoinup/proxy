@@ -42,13 +42,21 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 # ----------------------------------------------------------------------------
 # 常量
 # ----------------------------------------------------------------------------
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.2.0"
 readonly DEFAULT_NET="192.168.42"
-readonly DEFAULT_DNS="8.8.8.8,1.1.1.1"
 readonly DEFAULT_MTU=1280
 readonly IKE_PORT=500
 readonly NATT_PORT=4500
 readonly L2TP_PORT=1701
+
+# DNS 自动选择：优先服务器自身 DNS (公网地址且实测可递归解析)，否则使用兜底 DNS (按实测延迟择优)
+readonly DNS_FALLBACK=(223.5.5.5 119.29.29.29)
+readonly DNS_PROBE_NAME="www.baidu.com"
+readonly DNS_PROBE_TIMEOUT=2
+readonly RESOLVED_STUBS=" 127.0.0.53 127.0.0.54 "
+readonly RESOLVED_UPSTREAM_CONF="/run/systemd/resolve/resolv.conf"
+# 1.2.0 之前的固定默认 DNS：旧状态文件中为此值时视为默认 (改为自动选择)，否则视为手动指定
+readonly LEGACY_DEFAULT_DNS="8.8.8.8,1.1.1.1"
 
 readonly XL2TPD_SRC_VERSION="1.3.20"
 readonly XL2TPD_SRC_SHA256="3db95450c5e1efaeea7547af344b5621f4453af3c227f26ec43bcbc79087b045"
@@ -155,6 +163,10 @@ VPN_LOCAL_IP=""
 VPN_POOL=""
 DNS1=""
 DNS2=""
+DNS_MODE=""
+DNS_ORIGIN=""
+DNS_SERVERS=()
+DNS_SYSTEM_INTACT=0
 PPP_MTU=""
 
 FIREWALL_MODE=""
@@ -170,6 +182,8 @@ PREV_PASS=""
 PREV_PSK=""
 PREV_NET=""
 PREV_DNS=""
+PREV_DNS_MODE=""
+PREV_DNS_ORIGIN=""
 PREV_MTU=""
 PREV_FIREWALL=""
 PREV_FW_ZONE=""
@@ -248,6 +262,13 @@ cpu_count() {
     printf '%s' "$n"
 }
 
+# 本次运行共用的临时目录 (EXIT 时统一清理)
+ensure_tmp_dir() {
+    if [[ -z $TMP_DIR || ! -d $TMP_DIR ]]; then
+        TMP_DIR=$(mktemp -d /tmp/l2tp-vpn.XXXXXX)
+    fi
+}
+
 # 读取定长随机字节后过滤，避免 SIGPIPE 与 pipefail 冲突
 rand_str() {
     local len=$1 charset=$2 out="" chunk
@@ -264,6 +285,27 @@ is_ipv4() {
     for o in "${BASH_REMATCH[@]:1}"; do
         (( 10#$o <= 255 )) || return 1
     done
+    return 0
+}
+
+# 公网单播 IPv4：排除本机 / 私有 / CGNAT (含云厂商内部 DNS 100.100.x) / 链路本地 /
+# 基准测试 (198.18/15，常见于 Fake-IP) / 文档保留 / 组播与保留地址
+is_public_ipv4() {
+    local o1 o2 o3 rest
+    is_ipv4 "$1" || return 1
+    IFS=. read -r o1 o2 o3 rest <<<"$1"
+    o1=$((10#$o1)); o2=$((10#$o2)); o3=$((10#$o3))
+    if (( o1 == 0 || o1 == 10 || o1 == 127 || o1 >= 224
+        || (o1 == 100 && o2 >= 64 && o2 <= 127)
+        || (o1 == 169 && o2 == 254)
+        || (o1 == 172 && o2 >= 16 && o2 <= 31)
+        || (o1 == 192 && o2 == 168)
+        || (o1 == 192 && o2 == 0 && (o3 == 0 || o3 == 2))
+        || (o1 == 198 && (o2 == 18 || o2 == 19))
+        || (o1 == 198 && o2 == 51 && o3 == 100)
+        || (o1 == 203 && o2 == 0 && o3 == 113) )); then
+        return 1
+    fi
     return 0
 }
 
@@ -356,7 +398,9 @@ L2TP/IPsec VPN 一键部署脚本 v${SCRIPT_VERSION} (libreswan + xl2tpd)
   -p, --pass PASS      VPN 密码   (默认随机 16 位；可见 ASCII，不含空格 " \\ ')
   -k, --psk PSK        IPsec 预共享密钥 (默认随机 20 位；规则同密码)
       --net A.B.C      客户端网段前缀，/24 (默认 ${DEFAULT_NET} -> ${DEFAULT_NET}.0/24)
-      --dns D1[,D2]    下发给客户端的 DNS (默认 ${DEFAULT_DNS})
+      --dns auto|D1[,D2]
+                       下发给客户端的 DNS (默认 auto：优先服务器自身公网 DNS，不可用时
+                       在兜底 DNS ${DNS_FALLBACK[*]} 中按实测延迟择优；手动指定后重装沿用)
       --mtu N          PPP MTU/MRU 1200~1460 (默认 ${DEFAULT_MTU}，兼容 PPPoE/移动网络，避免分片)
   -i, --iface IFACE    指定外部出口网卡 (默认自动识别)
       --renew          重新随机生成用户名/密码/PSK (默认重装时沿用)
@@ -534,6 +578,8 @@ load_state() {
             VPN_IPSEC_PSK)         PREV_PSK=$val ;;
             VPN_NET)               PREV_NET=$val ;;
             VPN_DNS)               PREV_DNS=$val ;;
+            VPN_DNS_MODE)          PREV_DNS_MODE=$val ;;
+            VPN_DNS_ORIGIN)        PREV_DNS_ORIGIN=$val ;;
             VPN_MTU)               PREV_MTU=$val ;;
             FIREWALL_MODE)         PREV_FIREWALL=$val ;;
             FIREWALL_ZONE)         PREV_FW_ZONE=$val ;;
@@ -560,6 +606,8 @@ save_state() {
         printf 'VPN_IPSEC_PSK=%s\n' "$VPN_PSK"
         printf 'VPN_NET=%s\n' "$VPN_NET_PREFIX"
         printf 'VPN_DNS=%s\n' "$dns_list"
+        printf 'VPN_DNS_MODE=%s\n' "$DNS_MODE"
+        printf 'VPN_DNS_ORIGIN=%s\n' "$DNS_ORIGIN"
         printf 'VPN_MTU=%s\n' "$PPP_MTU"
         printf 'EGRESS_IF=%s\n' "$EGRESS_IF"
         printf 'PUBLIC_IP=%s\n' "$PUBLIC_IP"
@@ -611,7 +659,7 @@ validate_dns() {
     local list=$1 d
     local -a arr=()
     IFS=',' read -r -a arr <<<"$list"
-    (( ${#arr[@]} >= 1 && ${#arr[@]} <= 2 )) || die "DNS 需为 1~2 个 IPv4 地址，逗号分隔"
+    (( ${#arr[@]} >= 1 && ${#arr[@]} <= 2 )) || die "DNS 需为 auto 或 1~2 个 IPv4 地址 (逗号分隔)"
     for d in "${arr[@]}"; do
         is_ipv4 "$d" || die "DNS 地址不合法: '$d'"
     done
@@ -633,7 +681,6 @@ resolve_settings() {
     VPN_CIDR="${VPN_NET_PREFIX}.0/24"
     VPN_LOCAL_IP="${VPN_NET_PREFIX}.1"
     VPN_POOL="${VPN_NET_PREFIX}.10-${VPN_NET_PREFIX}.250"
-    validate_dns "${OPT_DNS:-${PREV_DNS:-$DEFAULT_DNS}}"
     validate_mtu "${OPT_MTU:-${PREV_MTU:-$DEFAULT_MTU}}"
 
     if [[ -n $OPT_USER ]]; then
@@ -664,8 +711,41 @@ resolve_settings() {
     fi
     validate_secret "PSK" "$VPN_PSK" 12
 
-    log_info "客户端网段: ${VPN_CIDR} (网关 ${VPN_LOCAL_IP})，DNS: ${DNS1}${DNS2:+, $DNS2}，MTU: ${PPP_MTU}"
+    log_info "客户端网段: ${VPN_CIDR} (网关 ${VPN_LOCAL_IP})，MTU: ${PPP_MTU}"
     log_info "VPN 用户: ${VPN_USER_NAME}"
+}
+
+# DNS 决策，优先级: --dns / VPN_DNS > 上次部署时手动指定的 DNS > 自动选择
+resolve_dns() {
+    log_step "选择客户端 DNS"
+    if [[ -n $OPT_DNS ]]; then
+        if [[ ${OPT_DNS,,} == "auto" ]]; then
+            DNS_MODE="auto"
+        else
+            DNS_MODE="manual"
+            validate_dns "$OPT_DNS"
+        fi
+    elif [[ $PREV_DNS_MODE == "manual" && -n $PREV_DNS ]]; then
+        DNS_MODE="manual"
+        validate_dns "$PREV_DNS"
+        log_info "沿用上次手动指定的 DNS (恢复自动选择请加 --dns auto)"
+    elif [[ -z $PREV_DNS_MODE && -n $PREV_DNS && $PREV_DNS != "$LEGACY_DEFAULT_DNS" ]]; then
+        # 旧版本状态文件未记录 DNS 模式：值不是旧默认值，说明是用户手动指定的
+        DNS_MODE="manual"
+        validate_dns "$PREV_DNS"
+        log_info "沿用上次手动指定的 DNS (恢复自动选择请加 --dns auto)"
+    else
+        DNS_MODE="auto"
+    fi
+
+    if [[ $DNS_MODE == "auto" ]]; then
+        select_dns
+        DNS1=${DNS_SERVERS[0]}
+        DNS2=${DNS_SERVERS[1]:-}
+    else
+        DNS_ORIGIN="manual"
+    fi
+    log_info "下发给客户端的 DNS: ${DNS1}${DNS2:+, $DNS2} ($(dns_origin_text))"
 }
 
 # ----------------------------------------------------------------------------
@@ -918,7 +998,7 @@ build_xl2tpd_from_source() {
         has_cmd "$c" || die "缺少编译工具 ${c}，且无法自动安装 (请检查软件源)"
     done
 
-    TMP_DIR=$(mktemp -d /tmp/l2tp-build.XXXXXX)
+    ensure_tmp_dir
     tarball="${TMP_DIR}/${XL2TPD_SRC_TARBALL}"
     src="${TMP_DIR}/xl2tpd-${XL2TPD_SRC_VERSION}"
     log="${TMP_DIR}/build.log"
@@ -1138,6 +1218,247 @@ detect_public_ip() {
     else
         log_info "公网 IP: ${PUBLIC_IP}"
     fi
+}
+
+# ----------------------------------------------------------------------------
+# DNS 自动选择 (下发给 VPN 客户端)
+#   1. 优先服务器自身 DNS：须为公网 IPv4 且实测可递归解析。客户端的 DNS 查询经隧道由本机 NAT
+#      转发，本机回环 (如 systemd-resolved 的 127.0.0.53，会换成其实际上游) / 内网等地址不予采用
+#   2. 自身 DNS 不可用时，在兜底 DNS 223.5.5.5 / 119.29.29.29 中按实测延迟择优
+#   全部候选并发探测，总耗时取决于最慢的超时；探测经 bash /dev/udp 直接收发 DNS 报文，
+#   不依赖 dig / nslookup 等外部工具
+# ----------------------------------------------------------------------------
+# 当前时间 (微秒)：bash 5+ 用 EPOCHREALTIME，否则用 date +%s%N
+now_us() {
+    local t
+    if [[ -n ${EPOCHREALTIME:-} ]]; then
+        t=${EPOCHREALTIME//[!0-9]/}
+        printf '%s' "$t"
+        return 0
+    fi
+    t=$(date +%s%N 2>/dev/null || true)
+    if [[ $t =~ ^[0-9]{16,}$ ]]; then
+        printf '%s' "$(( t / 1000 ))"
+    else
+        printf '%s' "$(( $(date +%s) * 1000000 ))"
+    fi
+}
+
+# 微秒 -> "12.3 ms"
+fmt_ms() {
+    printf '%d.%d ms' "$(( $1 / 1000 ))" "$(( $1 % 1000 / 100 ))"
+}
+
+# 单次 DNS 查询 (A 记录)。应答有效 (事务 ID 一致、QR=1、RA=1、RCODE=NOERROR、应答数 > 0)
+# 时输出往返耗时 (微秒)，否则返回 1
+dns_query_once() {
+    local ip=$1 bs='\x' id_hi id_lo id_hex fmt label t0 t1 hex flags ancount
+    # 事务 ID 字节限定 0x20~0x7e：bash 内建 printf 行缓冲输出，报文中出现 0x0a 会被拆成两个 UDP 包
+    id_hi=$(( RANDOM % 95 + 32 ))
+    id_lo=$(( RANDOM % 95 + 32 ))
+    printf -v id_hex '%02x%02x' "$id_hi" "$id_lo"
+    # 转义前缀 \x 经 %s 传入：bash 5.3 对格式串中的 "\\x" 会误报 missing hex digit
+    printf -v fmt '%s%02x%s%02x' "$bs" "$id_hi" "$bs" "$id_lo"
+    fmt+='\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+    for label in ${DNS_PROBE_NAME//./ }; do
+        printf -v fmt '%s%s%02x%s' "$fmt" "$bs" "${#label}" "$label"
+    done
+    fmt+='\x00\x00\x01\x00\x01'
+
+    t0=$(now_us)
+    # shellcheck disable=SC2059
+    hex=$( { ( exec 3<>"/dev/udp/${ip}/53" && printf "$fmt" >&3 \
+                && exec timeout "$DNS_PROBE_TIMEOUT" head -c 12 <&3 ) 2>/dev/null || true; } \
+            | od -An -tx1 -v | tr -d ' \n' ) || true
+    t1=$(now_us)
+
+    # 报文头 12 字节: ID(2) FLAGS(2) QDCOUNT(2) ANCOUNT(2) NSCOUNT(2) ARCOUNT(2)
+    [[ ${#hex} -eq 24 && ${hex:0:4} == "$id_hex" ]] || return 1
+    flags=$(( 16#${hex:4:4} ))
+    ancount=$(( 16#${hex:12:4} ))
+    (( (flags & 0x8000) != 0 && (flags & 0x0080) != 0 && (flags & 0x000f) == 0 && ancount > 0 )) || return 1
+    printf '%s' "$(( t1 - t0 ))"
+}
+
+# 探测单个 DNS：最多 3 次查询，2 次成功或 2 次失败即结束；输出成功查询中的最小耗时 (微秒)
+dns_probe() {
+    local ip=$1 rtt best="" ok=0 fail=0
+    while (( ok < 2 && fail < 2 )); do
+        if rtt=$(dns_query_once "$ip"); then
+            ok=$((ok + 1))
+            if [[ -z $best ]] || (( rtt < best )); then
+                best=$rtt
+            fi
+        else
+            fail=$((fail + 1))
+        fi
+    done
+    [[ -n $best ]] || return 1
+    printf '%s' "$best"
+}
+
+# 并发探测一组 DNS，每行输出 "<耗时微秒> <地址>" 并按耗时升序；无有效应答的地址不输出
+dns_probe_all() {
+    local dir=$1 i rtt
+    shift
+    local ips=("$@") pids=()
+    rm -rf -- "$dir"
+    mkdir -p -- "$dir"
+    for i in "${!ips[@]}"; do
+        (
+            if rtt=$(dns_probe "${ips[i]}"); then
+                printf '%s %s\n' "$rtt" "${ips[i]}" >"${dir}/${i}"
+            fi
+        ) &
+        pids+=("$!")
+    done
+    for i in "${pids[@]}"; do
+        wait "$i" || true
+    done
+    cat -- "$dir"/* 2>/dev/null | sort -n -k1,1 || true
+}
+
+resolv_nameservers() {
+    [[ -r $1 ]] || return 0
+    awk '$1 == "nameserver" && NF >= 2 { print $2 }' "$1" 2>/dev/null || true
+}
+
+# 服务器自身 DNS (去重保序)。systemd-resolved 本地存根 (127.0.0.53 / 127.0.0.54) 替换为其实际上游；
+# 上游未知时保留存根地址 (非公网地址，随后判定为不可用)
+system_dns_servers() {
+    local ns up seen=" "
+    local -a raw=() upstream=()
+    mapfile -t raw < <(resolv_nameservers /etc/resolv.conf)
+    mapfile -t upstream < <(resolv_nameservers "$RESOLVED_UPSTREAM_CONF")
+    for ns in ${raw[@]+"${raw[@]}"}; do
+        if [[ $RESOLVED_STUBS == *" ${ns} "* ]] && (( ${#upstream[@]} > 0 )); then
+            for up in "${upstream[@]}"; do
+                if [[ $seen != *" ${up} "* ]]; then
+                    printf '%s\n' "$up"
+                    seen+="${up} "
+                fi
+            done
+        elif [[ $seen != *" ${ns} "* ]]; then
+            printf '%s\n' "$ns"
+            seen+="${ns} "
+        fi
+    done
+}
+
+# 结果写入:
+#   DNS_SERVERS        选定的 DNS (有序，至多 2 个)
+#   DNS_ORIGIN         system        服务器自身 DNS
+#                      system_backup 服务器自身 DNS 仅 1 个可用，补充最快的兜底 DNS 作备用
+#                      fallback      自身 DNS 不可用，兜底 DNS 按实测延迟升序
+#                      unverified    全部候选均无应答 (出网 UDP 53 受限等)：自身 DNS 为公网地址则沿用，
+#                                    否则按默认顺序使用兜底 DNS
+#   DNS_SYSTEM_INTACT  1 = 服务器自身 DNS 全部为公网地址且可用，可原样使用
+select_dns() {
+    local ns ip rtt
+    local -a sys=() sys_public=() cand=() sys_ok=() fb_ok=()
+    local -A rtt_of=()
+    DNS_SERVERS=()
+    DNS_ORIGIN=""
+    DNS_SYSTEM_INTACT=0
+
+    mapfile -t sys < <(system_dns_servers)
+    if (( ${#sys[@]} > 0 )); then
+        log_info "服务器自身 DNS: ${sys[*]}"
+    else
+        log_warn "未从 /etc/resolv.conf 读取到服务器自身 DNS"
+    fi
+    for ns in ${sys[@]+"${sys[@]}"}; do
+        if is_public_ipv4 "$ns"; then
+            sys_public+=("$ns")
+        else
+            log_info "  ${ns}: 非公网 IPv4 地址 (本机 / 内网 / 云厂商内部)，不予采用"
+        fi
+    done
+    for ip in ${sys_public[@]+"${sys_public[@]}"} "${DNS_FALLBACK[@]}"; do
+        if [[ " ${cand[*]:-} " != *" ${ip} "* ]]; then
+            cand+=("$ip")
+        fi
+    done
+
+    if has_cmd timeout && has_cmd od; then
+        ensure_tmp_dir
+        log_info "并发探测 ${#cand[@]} 个 DNS 的可用性与延迟..."
+        while read -r rtt ip; do
+            if [[ $rtt =~ ^[0-9]+$ && -n $ip ]]; then
+                rtt_of[$ip]=$rtt
+            fi
+        done < <(dns_probe_all "${TMP_DIR}/dns-probe" "${cand[@]}")
+        for ip in "${cand[@]}"; do
+            if [[ -n ${rtt_of[$ip]:-} ]]; then
+                log_info "  ${ip}: $(fmt_ms "${rtt_of[$ip]}")"
+            else
+                log_info "  ${ip}: 无有效应答"
+            fi
+        done
+    else
+        log_warn "缺少 timeout / od 命令，无法探测 DNS"
+    fi
+
+    for ns in ${sys_public[@]+"${sys_public[@]}"}; do
+        if [[ -n ${rtt_of[$ns]:-} ]]; then
+            sys_ok+=("$ns")
+        fi
+    done
+    while read -r rtt ip; do
+        if [[ -n $ip ]]; then
+            fb_ok+=("$ip")
+        fi
+    done < <(for ip in "${DNS_FALLBACK[@]}"; do
+                 if [[ -n ${rtt_of[$ip]:-} ]]; then
+                     printf '%s %s\n' "${rtt_of[$ip]}" "$ip"
+                 fi
+             done | sort -n -k1,1)
+
+    if (( ${#rtt_of[@]} == 0 )); then
+        DNS_ORIGIN="unverified"
+        if (( ${#sys_public[@]} > 0 )); then
+            DNS_SERVERS=("${sys_public[@]:0:2}")
+            if (( ${#sys_public[@]} == ${#sys[@]} )); then
+                DNS_SYSTEM_INTACT=1
+            fi
+        else
+            DNS_SERVERS=("${DNS_FALLBACK[@]}")
+        fi
+        log_warn "全部 DNS 均无有效应答 (出网 UDP 53 可能受限)，无法实测，暂用: ${DNS_SERVERS[*]}"
+    elif (( ${#sys_ok[@]} > 0 )); then
+        DNS_ORIGIN="system"
+        DNS_SERVERS=("${sys_ok[@]:0:2}")
+        if (( ${#sys_ok[@]} == ${#sys[@]} )); then
+            DNS_SYSTEM_INTACT=1
+        fi
+        # 自身 DNS 仅 1 个可用时，补充最快的兜底 DNS 作备用，避免单点
+        for ip in ${fb_ok[@]+"${fb_ok[@]}"}; do
+            if (( ${#DNS_SERVERS[@]} >= 2 )); then
+                break
+            fi
+            if [[ " ${DNS_SERVERS[*]} " != *" ${ip} "* ]]; then
+                DNS_SERVERS+=("$ip")
+                DNS_ORIGIN="system_backup"
+            fi
+        done
+        log_info "服务器自身 DNS 为公网地址且可用，优先采用"
+    else
+        # 有应答但不含自身 DNS，说明应答来自兜底 DNS，fb_ok 必然非空
+        DNS_ORIGIN="fallback"
+        DNS_SERVERS=("${fb_ok[@]}")
+        log_info "服务器自身 DNS 不可用，采用兜底 DNS (按实测延迟排序)"
+    fi
+}
+
+dns_origin_text() {
+    case $DNS_ORIGIN in
+        system)        printf '服务器自身 DNS' ;;
+        system_backup) printf '服务器自身 DNS，兜底 DNS 作备用' ;;
+        fallback)      printf '兜底 DNS，按实测延迟择优' ;;
+        unverified)    printf '自动选择，探测无应答未能实测' ;;
+        manual)        printf '手动指定' ;;
+        *)             printf '来源未记录' ;;
+    esac
 }
 
 # ----------------------------------------------------------------------------
@@ -1377,7 +1698,16 @@ apply_base_sysctl() {
 }
 
 load_kernel_modules() {
-    local mods=("l2tp_ppp")
+    local mods=("xfrm_user" "esp4" "l2tp_ppp")
+    local required_module module_error
+    # A listening IKE daemon cannot install IPsec SAs without kernel ESP/XFRM.
+    # Respect modprobe install restrictions; never use --ignore-install.
+    for required_module in xfrm_user esp4; do
+        if ! module_error=$(modprobe "$required_module" 2>&1); then
+            log_error "Required IPsec module ${required_module} could not load: ${module_error}"
+            die "Check the running kernel and /etc/modprobe.d restrictions. Patch the kernel before changing security mitigations; do not bypass module policy."
+        fi
+    done
     # 内核态 L2TP：数据面不经用户态拷贝，显著降低延迟与 CPU 占用
     if modprobe -q l2tp_ppp 2>/dev/null; then
         log_info "内核态 L2TP (l2tp_ppp) 已加载"
@@ -1736,6 +2066,8 @@ After=${FW_UNIT_NAME}
 StartLimitIntervalSec=0
 
 [Service]
+ExecStartPre=${modprobe_bin} xfrm_user
+ExecStartPre=${modprobe_bin} esp4
 Restart=always
 RestartSec=2
 Nice=-10
@@ -1785,6 +2117,16 @@ ipsec_status_text() {
 verify_deployment() {
     log_step "部署自检"
     local failed=0 status
+
+    local required_module module_error
+    for required_module in xfrm_user esp4; do
+        if module_error=$(modprobe "$required_module" 2>&1); then
+            log_info "Required IPsec module ${required_module} is available"
+        else
+            log_error "Required IPsec module ${required_module} unavailable: ${module_error}"
+            failed=1
+        fi
+    done
 
     if systemctl is-active --quiet ipsec.service; then
         log_info "ipsec 服务运行中"
@@ -1910,7 +2252,7 @@ print_info() {
     kv "VPN 类型:" "L2TP/IPsec PSK (预共享密钥)，允许任意来源 IP 连接"
     kv "端口:" "UDP ${IKE_PORT} / ${NATT_PORT} (IPsec)，UDP ${L2TP_PORT} (L2TP，仅经 IPsec)"
     kv "客户端网段:" "${VPN_CIDR} (网关 ${VPN_LOCAL_IP})"
-    kv "DNS:" "${DNS1}${DNS2:+, $DNS2}"
+    kv "DNS:" "${DNS1:-未知}${DNS2:+, $DNS2} ($(dns_origin_text))"
     kv "MTU/MRU:" "$PPP_MTU"
     printf '%s\n' "$thin"
     kv "服务管理:" "systemctl {start|stop|restart|status} ipsec xl2tpd"
@@ -1945,6 +2287,7 @@ cmd_install() {
     FIREWALL_ZONE=$PREV_FW_ZONE
     XL2TPD_ORIGIN=$PREV_XL2TPD_ORIGIN
     resolve_settings
+    resolve_dns
     record_preinstalled
     # 尽早落盘部署状态，保证中途失败时 uninstall 仍能完整清理
     save_state
@@ -1985,7 +2328,11 @@ load_runtime_from_state() {
     VPN_NET_PREFIX=${PREV_NET:-$DEFAULT_NET}
     VPN_CIDR="${VPN_NET_PREFIX}.0/24"
     VPN_LOCAL_IP="${VPN_NET_PREFIX}.1"
-    validate_dns "${PREV_DNS:-$DEFAULT_DNS}"
+    if [[ -n $PREV_DNS ]]; then
+        validate_dns "$PREV_DNS"
+    fi
+    DNS_MODE=$PREV_DNS_MODE
+    DNS_ORIGIN=$PREV_DNS_ORIGIN
     PPP_MTU=${PREV_MTU:-$DEFAULT_MTU}
     FIREWALL_MODE=$PREV_FIREWALL
     FIREWALL_ZONE=$PREV_FW_ZONE
@@ -2057,6 +2404,13 @@ cmd_status() {
 
 cmd_restart() {
     load_runtime_from_state
+    # Check mandatory IPsec support before stopping a working service.
+    local required_module module_error
+    for required_module in xfrm_user esp4; do
+        if ! module_error=$(modprobe "$required_module" 2>&1); then
+            die "Required IPsec module ${required_module} unavailable: ${module_error}; review the kernel and modprobe policy first."
+        fi
+    done
     if [[ $FIREWALL_MODE == "iptables" ]]; then
         systemctl restart "$FW_UNIT_NAME"
     fi
